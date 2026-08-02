@@ -19,6 +19,8 @@
     "test:e2e": "turbo run test:e2e",
     "typecheck": "turbo run typecheck",
     "clean": "turbo run clean && rm -rf node_modules",
+    "db:generate": "pnpm --filter @tripplanner/api exec prisma generate",
+    "db:migrate": "pnpm --filter @tripplanner/api exec prisma migrate dev",
     "prepare": "husky"
   },
   "devDependencies": {
@@ -36,5 +38,11 @@
     "*.{md,json}": [
       "prettier --write"
     ]
+  },
+  "pnpm": {
+    "overrides": {
+      "react": "19.2.8",
+      "react-dom": "19.2.8"
+    }
   }
 }

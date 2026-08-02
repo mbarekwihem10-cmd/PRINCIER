@@ -1,0 +1,29 @@
+{
+  "name": "@tripplanner/shared-validation",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Schémas de validation Zod partagés entre les apps TripPlanner (api, web, mobile).",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint \"src/**/*.ts\" --fix"
+  },
+  "dependencies": {
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@tripplanner/eslint-config": "workspace:*",
+    "@tripplanner/shared-types": "workspace:*",
+    "@tripplanner/tsconfig": "workspace:*",
+    "eslint": "^8.57.0",
+    "typescript": "^5.4.5"
+  }
+}

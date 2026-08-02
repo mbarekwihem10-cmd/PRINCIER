@@ -1,0 +1,25 @@
+// Schéma minimal du bootstrap (Étape 1) : uniquement le modèle nécessaire au
+// squelette Users/Auth. Le schéma complet des 8 domaines métier de
+// docs/database-design.md sera écrit à l'Étape 2.
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id           String    @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  email        String    @unique @db.Citext
+  passwordHash String    @map("password_hash")
+  firstName    String    @map("first_name") @db.VarChar(100)
+  lastName     String    @map("last_name") @db.VarChar(100)
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt    DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+  deletedAt    DateTime? @map("deleted_at") @db.Timestamptz
+
+  @@map("users")
+}
