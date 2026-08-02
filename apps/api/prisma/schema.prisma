@@ -1,25 +1,1447 @@
-// Schéma minimal du bootstrap (Étape 1) : uniquement le modèle nécessaire au
-// squelette Users/Auth. Le schéma complet des 8 domaines métier de
-// docs/database-design.md sera écrit à l'Étape 2.
+// Schéma complet — Étape 2 (docs/database-design.md v2 étendu selon le plan
+// approuvé /Users/wihem/.claude/plans/keen-munching-ocean.md).
+//
+// Contraintes non exprimables dans Prisma Schema Language, ajoutées
+// manuellement dans la migration SQL (déjà appliquées en base) :
+//   - CHECK constraints (montants, dates cohérentes, note 1-5...).
+//   - Index uniques PARTIELS sur users.email (WHERE deleted_at IS NULL)
+//     et trip_invitations (WHERE status = 'pending').
+// Restent volontairement en UNIQUE plein (identité stable, décision
+// produit validée — pas une limitation technique) : establishments
+// (providerId, externalRef), drivers.userId, bookings (provider,
+// providerReference), reviews.bookingId.
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider          = "postgresql"
+  url               = env("DATABASE_URL")
+  shadowDatabaseUrl = env("SHADOW_DATABASE_URL")
 }
 
 generator client {
   provider = "prisma-client-js"
 }
 
+// =============================================================================
+// PLATEFORME (module Admin, + Currency utilisé partout)
+// =============================================================================
+
+model Currency {
+  code          String @id @db.Char(3)
+  symbol        String @db.VarChar(5)
+  decimalPlaces Int    @default(2) @map("decimal_places") @db.SmallInt
+
+  trips              Trip[]
+  bookings           Booking[]
+  expenses           Expense[]
+  settlements        Settlement[]
+  tripBalances       TripBalance[]
+  payments           Payment[]
+  refunds            Refund[]
+  commissionEntries  CommissionEntry[]
+  payouts            Payout[]
+  invoices           Invoice[]
+  walletBalances     WalletBalance[]
+  walletTransactions WalletTransaction[]
+
+  @@map("currencies")
+}
+
+model File {
+  id         String    @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  ownerType  String    @map("owner_type") @db.VarChar(30)
+  ownerId    String    @map("owner_id") @db.Uuid
+  uploaderId String    @map("uploader_id") @db.Uuid
+  storageKey String    @unique @map("storage_key")
+  mimeType   String    @map("mime_type") @db.VarChar(100)
+  sizeBytes  BigInt    @map("size_bytes")
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  deletedAt  DateTime? @map("deleted_at") @db.Timestamptz
+
+  uploader User @relation(fields: [uploaderId], references: [id], onDelete: Restrict)
+
+  userAvatarOf     User[]           @relation("UserAvatar")
+  tripCoverOf      Trip[]           @relation("TripCover")
+  expenseReceiptOf Expense[]        @relation("ExpenseReceipt")
+  travelDocumentOf TravelDocument[] @relation("TravelDocumentFile")
+  invoicePdfOf     Invoice[]        @relation("InvoicePdf")
+
+  @@index([ownerType, ownerId])
+  @@map("files")
+}
+
+model AuditLog {
+  id         String   @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  actorId    String?  @map("actor_id") @db.Uuid
+  action     String   @db.VarChar(100)
+  entityType String   @map("entity_type") @db.VarChar(50)
+  entityId   String   @map("entity_id") @db.Uuid
+  metadata   Json?
+  ipAddress  String?  @map("ip_address")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  actor User? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@map("audit_logs")
+}
+
+model IdempotencyKey {
+  id               String   @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  key              String   @unique @db.VarChar(200)
+  responseSnapshot Json?    @map("response_snapshot")
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  @@map("idempotency_keys")
+}
+
+model FeatureFlag {
+  id                String   @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  key               String   @unique @db.VarChar(100)
+  description       String?
+  enabled           Boolean  @default(false)
+  rolloutPercentage Int      @default(0) @map("rollout_percentage") @db.SmallInt
+  createdAt         DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt         DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  @@map("feature_flags")
+}
+
+/// Idempotence des webhooks fournisseurs (contrainte n°10), distincte de
+/// IdempotencyKey (réservée aux endpoints API arbitraires).
+model WebhookEvent {
+  id              String    @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  provider        String    @db.VarChar(50)
+  eventType       String    @map("event_type") @db.VarChar(100)
+  externalEventId String    @map("external_event_id") @db.VarChar(200)
+  payload         Json
+  receivedAt      DateTime  @default(now()) @map("received_at") @db.Timestamptz
+  processedAt     DateTime? @map("processed_at") @db.Timestamptz
+  processingError String?   @map("processing_error")
+
+  @@unique([provider, externalEventId])
+  @@index([provider, receivedAt])
+  @@map("webhook_events")
+}
+
+// =============================================================================
+// IDENTITÉ & PROFILS (module Users / Auth)
+// =============================================================================
+
 model User {
+  id              String    @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  email           String    @unique @db.Citext
+  passwordHash    String    @map("password_hash")
+  firstName       String    @map("first_name") @db.VarChar(100)
+  lastName        String    @map("last_name") @db.VarChar(100)
+  avatarFileId    String?   @map("avatar_file_id") @db.Uuid
+  phone           String?   @db.VarChar(30)
+  locale          String    @default("fr-FR") @db.VarChar(10)
+  timezone        String    @default("Europe/Paris") @db.VarChar(50)
+  emailVerifiedAt DateTime? @map("email_verified_at") @db.Timestamptz
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt       DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+  deletedAt       DateTime? @map("deleted_at") @db.Timestamptz
+
+  avatarFile File? @relation("UserAvatar", fields: [avatarFileId], references: [id])
+
+  authIdentities          AuthIdentity[]
+  refreshTokens           RefreshToken[]
+  userRoles               UserRole[]
+  travelDocuments         TravelDocument[]
+  emergencyContacts       EmergencyContact[]
+  uploadedFiles           File[]
+  auditLogs               AuditLog[]
+  createdTravelGroups     TravelGroup[]
+  travelGroupMembers      TravelGroupMember[]
+  createdTrips            Trip[]                   @relation("TripCreatedBy")
+  tripMemberships         TripMember[]             @relation("TripMemberUser")
+  invitedTripMembers      TripMember[]             @relation("TripMemberInvitedBy")
+  sentTripInvitations     TripInvitation[]
+  availabilities          Availability[]
+  createdCalendarEvents   CalendarEvent[]
+  personalCalendarEvents  PersonalCalendarEvent[]
+  driverProfile           Driver?
+  bookedBookings          Booking[]
+  sentMessages            Message[]
+  messageReads            MessageRead[]
+  notifications           Notification[]
+  notificationPreferences NotificationPreference[]
+  favorites               Favorite[]
+  reviews                 Review[]
+  wallet                  Wallet?
+
+  @@map("users")
+}
+
+/// Prépare le login social (Google, Apple) sans le développer au MVP.
+model AuthIdentity {
+  id             String   @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  userId         String   @map("user_id") @db.Uuid
+  provider       String   @db.VarChar(30)
+  providerUserId String   @map("provider_user_id")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerUserId])
+  @@map("auth_identities")
+}
+
+model RefreshToken {
+  id        String    @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz
+  revokedAt DateTime? @map("revoked_at") @db.Timestamptz
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+/// Rôles globaux de plateforme (admin, support) — distincts des rôles au
+/// sein d'un voyage (trip_members.role).
+model Role {
+  id   String @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  name String @unique @db.VarChar(50)
+
+  userRoles       UserRole[]
+  rolePermissions RolePermission[]
+
+  @@map("roles")
+}
+
+model UserRole {
+  userId String @map("user_id") @db.Uuid
+  roleId String @map("role_id") @db.Uuid
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([userId, roleId])
+  @@map("user_roles")
+}
+
+/// Permissions fines, seedées par le code — jamais gérées par une UI
+/// dynamique (YAGNI).
+model Permission {
+  id          String  @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  key         String  @unique @db.VarChar(150)
+  description String?
+
+  rolePermissions RolePermission[]
+
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId       String @map("role_id") @db.Uuid
+  permissionId String @map("permission_id") @db.Uuid
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+enum TravelDocumentType {
+  Passport      @map("passport")
+  NationalId    @map("national_id")
+  Visa          @map("visa")
+  DriverLicense @map("driver_license")
+}
+
+/// Passeport/CNI/visa/permis d'un utilisateur. Le numéro complet n'est
+/// jamais stocké en clair — seul un identifiant masqué est indexable.
+model TravelDocument {
+  id                   String             @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  userId               String             @map("user_id") @db.Uuid
+  type                 TravelDocumentType
+  issuingCountry       String             @map("issuing_country") @db.Char(2)
+  documentNumberMasked String?            @map("document_number_masked") @db.VarChar(20)
+  expiryDate           DateTime           @map("expiry_date") @db.Date
+  fileId               String             @map("file_id") @db.Uuid
+  createdAt            DateTime           @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt            DateTime           @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+  deletedAt            DateTime?          @map("deleted_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  file File @relation("TravelDocumentFile", fields: [fileId], references: [id])
+
+  @@map("travel_documents")
+}
+
+model EmergencyContact {
   id           String    @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
-  email        String    @unique @db.Citext
-  passwordHash String    @map("password_hash")
-  firstName    String    @map("first_name") @db.VarChar(100)
-  lastName     String    @map("last_name") @db.VarChar(100)
+  userId       String    @map("user_id") @db.Uuid
+  fullName     String    @map("full_name") @db.VarChar(200)
+  relationship String    @db.VarChar(50)
+  phone        String    @db.VarChar(30)
+  email        String?   @db.VarChar(255)
   createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz
   updatedAt    DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
   deletedAt    DateTime? @map("deleted_at") @db.Timestamptz
 
-  @@map("users")
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("emergency_contacts")
+}
+
+// =============================================================================
+// VOYAGES & COLLABORATION (module Trips)
+// =============================================================================
+
+enum TravelGroupMemberRole {
+  Admin  @map("admin")
+  Member @map("member")
+}
+
+/// Cercle d'amis persistant, réutilisable sur plusieurs voyages — distinct
+/// de TripMember qui reste "qui est confirmé sur CE voyage".
+model TravelGroup {
+  id        String    @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  name      String    @db.VarChar(200)
+  createdBy String    @map("created_by") @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz
+
+  creator User                @relation(fields: [createdBy], references: [id], onDelete: Restrict)
+  members TravelGroupMember[]
+  trips   Trip[]
+
+  @@map("travel_groups")
+}
+
+model TravelGroupMember {
+  id            String                @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  travelGroupId String                @map("travel_group_id") @db.Uuid
+  userId        String                @map("user_id") @db.Uuid
+  role          TravelGroupMemberRole @default(Member)
+  joinedAt      DateTime              @default(now()) @map("joined_at") @db.Timestamptz
+
+  travelGroup TravelGroup @relation(fields: [travelGroupId], references: [id], onDelete: Cascade)
+  user        User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([travelGroupId, userId])
+  @@map("travel_group_members")
+}
+
+enum TripStatus {
+  Planning  @map("planning")
+  Confirmed @map("confirmed")
+  Completed @map("completed")
+  Archived  @map("archived")
+}
+
+model Trip {
+  id               String     @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  name             String     @db.VarChar(200)
+  description      String?
+  coverImageFileId String?    @map("cover_image_file_id") @db.Uuid
+  destination      String?    @db.VarChar(200)
+  startDate        DateTime?  @map("start_date") @db.Date
+  endDate          DateTime?  @map("end_date") @db.Date
+  baseCurrency     String     @map("base_currency") @db.Char(3)
+  status           TripStatus @default(Planning)
+  travelGroupId    String?    @map("travel_group_id") @db.Uuid
+  createdBy        String     @map("created_by") @db.Uuid
+  createdAt        DateTime   @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt        DateTime   @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+  deletedAt        DateTime?  @map("deleted_at") @db.Timestamptz
+
+  coverImageFile  File?        @relation("TripCover", fields: [coverImageFileId], references: [id])
+  baseCurrencyRef Currency     @relation(fields: [baseCurrency], references: [code], onDelete: Restrict)
+  travelGroup     TravelGroup? @relation(fields: [travelGroupId], references: [id], onDelete: SetNull)
+  creator         User         @relation("TripCreatedBy", fields: [createdBy], references: [id], onDelete: Restrict)
+
+  members        TripMember[]
+  invitations    TripInvitation[]
+  availabilities Availability[]
+  calendarEvents CalendarEvent[]
+  bookings       Booking[]
+  expenses       Expense[]
+  settlements    Settlement[]
+  tripBalances   TripBalance[]
+  conversation   Conversation?
+
+  @@index([createdBy])
+  @@index([status])
+  @@map("trips")
+}
+
+enum TripMemberRole {
+  Owner  @map("owner")
+  Editor @map("editor")
+  Member @map("member")
+}
+
+enum TripMemberStatus {
+  Invited  @map("invited")
+  Accepted @map("accepted")
+  Declined @map("declined")
+  Removed  @map("removed")
+}
+
+model TripMember {
+  id        String           @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  tripId    String           @map("trip_id") @db.Uuid
+  userId    String           @map("user_id") @db.Uuid
+  role      TripMemberRole   @default(Member)
+  status    TripMemberStatus @default(Invited)
+  invitedBy String?          @map("invited_by") @db.Uuid
+  joinedAt  DateTime?        @map("joined_at") @db.Timestamptz
+  createdAt DateTime         @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime         @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  trip    Trip  @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  user    User  @relation("TripMemberUser", fields: [userId], references: [id], onDelete: Cascade)
+  inviter User? @relation("TripMemberInvitedBy", fields: [invitedBy], references: [id], onDelete: SetNull)
+
+  flightPassengers FlightPassenger[]
+  expensesPaid     Expense[]
+  expenseShares    ExpenseShare[]
+  settlementsFrom  Settlement[]      @relation("SettlementFrom")
+  settlementsTo    Settlement[]      @relation("SettlementTo")
+  tripBalances     TripBalance[]
+  paymentsMade     Payment[]
+
+  @@unique([tripId, userId])
+  @@index([userId])
+  @@map("trip_members")
+}
+
+/// Invitations par email vers des personnes pas encore inscrites. `status`
+/// reste varchar (non converti en enum, cf. plan §3).
+model TripInvitation {
+  id        String   @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  tripId    String   @map("trip_id") @db.Uuid
+  email     String   @db.Citext
+  token     String   @unique @db.VarChar(64)
+  invitedBy String   @map("invited_by") @db.Uuid
+  status    String   @default("pending") @db.VarChar(20)
+  expiresAt DateTime @map("expires_at") @db.Timestamptz
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  trip    Trip @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  inviter User @relation(fields: [invitedBy], references: [id], onDelete: Cascade)
+
+  @@unique([tripId, email])
+  @@map("trip_invitations")
+}
+
+enum AvailabilityStatus {
+  Available   @map("available")
+  Unavailable @map("unavailable")
+  Maybe       @map("maybe")
+}
+
+model Availability {
+  id        String             @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  tripId    String             @map("trip_id") @db.Uuid
+  userId    String             @map("user_id") @db.Uuid
+  date      DateTime           @db.Date
+  status    AvailabilityStatus
+  createdAt DateTime           @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime           @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  trip Trip @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([tripId, userId, date])
+  @@index([tripId, date])
+  @@map("availabilities")
+}
+
+/// Événements du voyage — collaboratif, visible par tous les membres.
+model CalendarEvent {
+  id          String    @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  tripId      String    @map("trip_id") @db.Uuid
+  title       String    @db.VarChar(200)
+  description String?
+  startAt     DateTime  @map("start_at") @db.Timestamptz
+  endAt       DateTime? @map("end_at") @db.Timestamptz
+  location    String?   @db.VarChar(200)
+  createdBy   String?   @map("created_by") @db.Uuid
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt   DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+  deletedAt   DateTime? @map("deleted_at") @db.Timestamptz
+
+  trip    Trip  @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  creator User? @relation(fields: [createdBy], references: [id], onDelete: SetNull)
+
+  @@index([tripId, startAt])
+  @@map("calendar_events")
+}
+
+/// Calendrier PERSONNEL — table distincte de CalendarEvent pour que la
+/// frontière de confidentialité soit structurelle (§10.3 du plan).
+model PersonalCalendarEvent {
+  id          String    @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  userId      String    @map("user_id") @db.Uuid
+  title       String    @db.VarChar(200)
+  description String?
+  startAt     DateTime  @map("start_at") @db.Timestamptz
+  endAt       DateTime? @map("end_at") @db.Timestamptz
+  location    String?   @db.VarChar(200)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt   DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+  deletedAt   DateTime? @map("deleted_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, startAt])
+  @@map("personal_calendar_events")
+}
+
+// =============================================================================
+// PRESTATAIRES & ÉTABLISSEMENTS (module Providers) — marketplace partiel
+// =============================================================================
+
+enum ProviderType {
+  Aggregator    @map("aggregator")
+  DirectPartner @map("direct_partner")
+}
+
+enum ProviderOnboardingStatus {
+  Pending   @map("pending")
+  Verified  @map("verified")
+  Active    @map("active")
+  Suspended @map("suspended")
+}
+
+model Provider {
+  id                    String                   @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  type                  ProviderType
+  businessName          String                   @map("business_name") @db.VarChar(200)
+  legalName             String?                  @map("legal_name") @db.VarChar(200)
+  taxId                 String?                  @map("tax_id") @db.VarChar(50)
+  contactEmail          String?                  @map("contact_email") @db.VarChar(255)
+  contactPhone          String?                  @map("contact_phone") @db.VarChar(30)
+  commissionRateDefault Decimal                  @default(0) @map("commission_rate_default") @db.Decimal(5, 4)
+  onboardingStatus      ProviderOnboardingStatus @default(Pending) @map("onboarding_status")
+  verifiedAt            DateTime?                @map("verified_at") @db.Timestamptz
+  createdAt             DateTime                 @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt             DateTime                 @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+  deletedAt             DateTime?                @map("deleted_at") @db.Timestamptz
+
+  establishments Establishment[]
+  drivers        Driver[]
+  payoutAccounts ProviderPayoutAccount[]
+
+  @@map("providers")
+}
+
+enum EstablishmentType {
+  Hotel           @map("hotel")
+  Restaurant      @map("restaurant")
+  ActivityVenue   @map("activity_venue")
+  CarRentalBranch @map("car_rental_branch")
+  EventVenue      @map("event_venue")
+}
+
+enum EstablishmentStatus {
+  Active    @map("active")
+  Inactive  @map("inactive")
+  Suspended @map("suspended")
+}
+
+/// Instance physique (hôtel, restaurant, agence de location, salle
+/// d'activité/événement). `UNIQUE(providerId, externalRef)` profite
+/// nativement de la sémantique NULL de PostgreSQL (deux NULL ne sont jamais
+/// égaux) — aucune clause WHERE partielle nécessaire pour ce cas précis.
+model Establishment {
+  id                     String              @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  providerId             String              @map("provider_id") @db.Uuid
+  type                   EstablishmentType
+  name                   String              @db.VarChar(200)
+  addressLine1           String?             @map("address_line1") @db.VarChar(255)
+  city                   String?             @db.VarChar(120)
+  countryCode            String?             @map("country_code") @db.Char(2)
+  latitude               Decimal?            @db.Decimal(9, 6)
+  longitude              Decimal?            @db.Decimal(9, 6)
+  externalRef            String?             @map("external_ref") @db.VarChar(200)
+  commissionRateOverride Decimal?            @map("commission_rate_override") @db.Decimal(5, 4)
+  status                 EstablishmentStatus @default(Active)
+  createdAt              DateTime            @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt              DateTime            @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+  deletedAt              DateTime?           @map("deleted_at") @db.Timestamptz
+
+  provider Provider @relation(fields: [providerId], references: [id], onDelete: Restrict)
+
+  carRentalBookings  CarRentalBooking[]
+  activityBookings   ActivityBooking[]
+  restaurantBookings RestaurantBooking[]
+  deliveryOrders     DeliveryOrder[]
+  eventBookingsVenue EventBooking[]
+
+  @@unique([providerId, externalRef])
+  @@index([type, city])
+  @@map("establishments")
+}
+
+enum DriverStatus {
+  PendingVerification @map("pending_verification")
+  Active              @map("active")
+  Suspended           @map("suspended")
+  Deactivated         @map("deactivated")
+}
+
+/// Chauffeur/livreur recruté par la plateforme. `userId` unique — un
+/// chauffeur est aussi un utilisateur, pas de duplication d'identité.
+model Driver {
+  id         String       @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  providerId String       @map("provider_id") @db.Uuid
+  userId     String       @unique @map("user_id") @db.Uuid
+  status     DriverStatus @default(PendingVerification)
+  createdAt  DateTime     @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt  DateTime     @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+  deletedAt  DateTime?    @map("deleted_at") @db.Timestamptz
+
+  provider Provider @relation(fields: [providerId], references: [id], onDelete: Restrict)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  vehicles         Vehicle[]
+  backgroundChecks DriverBackgroundCheck[]
+  payoutAccounts   DriverPayoutAccount[]
+  rideBookings     RideBooking[]
+  deliveryOrders   DeliveryOrder[]
+
+  @@map("drivers")
+}
+
+enum VehicleType {
+  Sedan   @map("sedan")
+  Van     @map("van")
+  Scooter @map("scooter")
+  Bike    @map("bike")
+}
+
+enum VehicleStatus {
+  Active   @map("active")
+  Inactive @map("inactive")
+}
+
+/// Véhicule d'un chauffeur (VTC/livraison) — ne couvre pas les flottes de
+/// location (car_rental_bookings reste dénormalisé, cf. plan §8).
+model Vehicle {
+  id          String        @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  driverId    String        @map("driver_id") @db.Uuid
+  type        VehicleType
+  plateNumber String        @map("plate_number") @db.VarChar(20)
+  brand       String?       @db.VarChar(100)
+  model       String?       @db.VarChar(100)
+  year        Int?          @db.SmallInt
+  capacity    Int?          @db.SmallInt
+  status      VehicleStatus @default(Active)
+  createdAt   DateTime      @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt   DateTime      @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  driver       Driver        @relation(fields: [driverId], references: [id], onDelete: Cascade)
+  rideBookings RideBooking[]
+
+  @@map("vehicles")
+}
+
+enum DriverBackgroundCheckStatus {
+  Pending @map("pending")
+  Passed  @map("passed")
+  Failed  @map("failed")
+  Expired @map("expired")
+}
+
+/// Historique de vérification — jamais écrasé, chaque contrôle est une
+/// nouvelle ligne (traçabilité légale de conformité).
+model DriverBackgroundCheck {
+  id              String                      @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  driverId        String                      @map("driver_id") @db.Uuid
+  status          DriverBackgroundCheckStatus
+  provider        String                      @db.VarChar(50)
+  externalCheckId String?                     @map("external_check_id") @db.VarChar(200)
+  checkedAt       DateTime                    @map("checked_at") @db.Timestamptz
+  expiresAt       DateTime?                   @map("expires_at") @db.Timestamptz
+  createdAt       DateTime                    @default(now()) @map("created_at") @db.Timestamptz
+
+  driver Driver @relation(fields: [driverId], references: [id], onDelete: Cascade)
+
+  @@index([driverId, checkedAt(sort: Desc)])
+  @@map("driver_background_checks")
+}
+
+/// Référence tokenisée vers un compte de reversement (Stripe Connect ou
+/// équivalent) — aucune donnée bancaire brute stockée (cf. plan §7).
+model ProviderPayoutAccount {
+  id                       String   @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  providerId               String   @map("provider_id") @db.Uuid
+  currency                 String   @db.Char(3)
+  externalAccountReference String   @map("external_account_reference") @db.VarChar(200)
+  isDefault                Boolean  @default(true) @map("is_default")
+  createdAt                DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  provider Provider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@map("provider_payout_accounts")
+}
+
+model DriverPayoutAccount {
+  id                       String   @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  driverId                 String   @map("driver_id") @db.Uuid
+  currency                 String   @db.Char(3)
+  externalAccountReference String   @map("external_account_reference") @db.VarChar(200)
+  isDefault                Boolean  @default(true) @map("is_default")
+  createdAt                DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  driver Driver @relation(fields: [driverId], references: [id], onDelete: Cascade)
+
+  @@map("driver_payout_accounts")
+}
+
+// =============================================================================
+// RÉSERVATIONS MULTI-SERVICES — kernel Bookings + verticaux
+// =============================================================================
+
+enum BookingType {
+  Flight     @map("flight")
+  Stay       @map("stay")
+  Ride       @map("ride")
+  CarRental  @map("car_rental")
+  Activity   @map("activity")
+  Restaurant @map("restaurant")
+  Delivery   @map("delivery")
+  Event      @map("event")
+  Esim       @map("esim")
+}
+
+enum BookingStatus {
+  Pending   @map("pending")
+  Confirmed @map("confirmed")
+  Cancelled @map("cancelled")
+  Failed    @map("failed")
+}
+
+/// Header générique partagé par tous les verticaux de réservation. Possédé
+/// par le module kernel `Bookings` (cf. plan §10.1) — les modules verticaux
+/// n'accèdent jamais directement à ce repository, uniquement via
+/// BookingsService. Le header reste strictement limité à ces champs :
+/// toute donnée spécifique à un vertical vit dans sa table de détail ou
+/// dans raw_provider_payload (risque de dérive documenté en §11 du plan).
+model Booking {
+  id                String        @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  tripId            String        @map("trip_id") @db.Uuid
+  type              BookingType
+  provider          String        @db.VarChar(50)
+  providerReference String        @map("provider_reference") @db.VarChar(200)
+  status            BookingStatus @default(Pending)
+  totalAmount       Decimal       @map("total_amount") @db.Decimal(12, 2)
+  currency          String        @db.Char(3)
+  bookedBy          String        @map("booked_by") @db.Uuid
+  version           Int           @default(0)
+  createdAt         DateTime      @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt         DateTime      @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+  deletedAt         DateTime?     @map("deleted_at") @db.Timestamptz
+
+  trip        Trip     @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  currencyRef Currency @relation(fields: [currency], references: [code], onDelete: Restrict)
+  booker      User     @relation(fields: [bookedBy], references: [id], onDelete: Restrict)
+
+  flightBooking     FlightBooking?
+  stayBooking       StayBooking?
+  rideBooking       RideBooking?
+  carRentalBooking  CarRentalBooking?
+  activityBooking   ActivityBooking?
+  restaurantBooking RestaurantBooking?
+  deliveryOrder     DeliveryOrder?
+  eventBooking      EventBooking?
+  esimOrder         EsimOrder?
+
+  payments          Payment[]
+  commissionEntries CommissionEntry[]
+  reviews           Review[]
+
+  @@unique([provider, providerReference])
+  @@index([tripId, type])
+  @@map("bookings")
+}
+
+model FlightBooking {
+  id                           String   @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  bookingId                    String   @unique @map("booking_id") @db.Uuid
+  originAirport                String   @map("origin_airport") @db.Char(3)
+  destinationAirport           String   @map("destination_airport") @db.Char(3)
+  departureAt                  DateTime @map("departure_at") @db.Timestamptz
+  arrivalAt                    DateTime @map("arrival_at") @db.Timestamptz
+  airline                      String   @db.VarChar(100)
+  flightNumber                 String   @map("flight_number") @db.VarChar(10)
+  cabinClass                   String   @map("cabin_class") @db.VarChar(20)
+  rawProviderPayload           Json     @map("raw_provider_payload")
+  providerPayloadSchemaVersion String   @map("provider_payload_schema_version") @db.VarChar(20)
+
+  booking    Booking           @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  passengers FlightPassenger[]
+
+  @@map("flight_bookings")
+}
+
+model FlightPassenger {
+  id              String   @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  flightBookingId String   @map("flight_booking_id") @db.Uuid
+  tripMemberId    String   @map("trip_member_id") @db.Uuid
+  firstName       String   @map("first_name") @db.VarChar(100)
+  lastName        String   @map("last_name") @db.VarChar(100)
+  seat            String?  @db.VarChar(10)
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  flightBooking FlightBooking @relation(fields: [flightBookingId], references: [id], onDelete: Cascade)
+  tripMember    TripMember    @relation(fields: [tripMemberId], references: [id], onDelete: Cascade)
+
+  @@map("flight_passengers")
+}
+
+model StayBooking {
+  id                           String   @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  bookingId                    String   @unique @map("booking_id") @db.Uuid
+  propertyName                 String   @map("property_name") @db.VarChar(200)
+  address                      String?
+  checkInDate                  DateTime @map("check_in_date") @db.Date
+  checkOutDate                 DateTime @map("check_out_date") @db.Date
+  guestsCount                  Int      @map("guests_count") @db.SmallInt
+  providerPropertyId           String?  @map("provider_property_id") @db.VarChar(100)
+  rawProviderPayload           Json     @map("raw_provider_payload")
+  providerPayloadSchemaVersion String   @map("provider_payload_schema_version") @db.VarChar(20)
+
+  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+
+  @@index([checkInDate, checkOutDate])
+  @@map("stay_bookings")
+}
+
+model RideBooking {
+  id                           String    @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  bookingId                    String    @unique @map("booking_id") @db.Uuid
+  driverId                     String?   @map("driver_id") @db.Uuid
+  vehicleId                    String?   @map("vehicle_id") @db.Uuid
+  pickupLocation               String    @map("pickup_location") @db.VarChar(255)
+  pickupLatitude               Decimal?  @map("pickup_latitude") @db.Decimal(9, 6)
+  pickupLongitude              Decimal?  @map("pickup_longitude") @db.Decimal(9, 6)
+  dropoffLocation              String    @map("dropoff_location") @db.VarChar(255)
+  dropoffLatitude              Decimal?  @map("dropoff_latitude") @db.Decimal(9, 6)
+  dropoffLongitude             Decimal?  @map("dropoff_longitude") @db.Decimal(9, 6)
+  requestedAt                  DateTime  @map("requested_at") @db.Timestamptz
+  pickedUpAt                   DateTime? @map("picked_up_at") @db.Timestamptz
+  droppedOffAt                 DateTime? @map("dropped_off_at") @db.Timestamptz
+  rawProviderPayload           Json      @map("raw_provider_payload")
+  providerPayloadSchemaVersion String    @map("provider_payload_schema_version") @db.VarChar(20)
+
+  booking Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  driver  Driver?  @relation(fields: [driverId], references: [id], onDelete: SetNull)
+  vehicle Vehicle? @relation(fields: [vehicleId], references: [id], onDelete: SetNull)
+
+  @@map("ride_bookings")
+}
+
+model CarRentalBooking {
+  id                           String   @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  bookingId                    String   @unique @map("booking_id") @db.Uuid
+  establishmentId              String   @map("establishment_id") @db.Uuid
+  vehicleCategory              String   @map("vehicle_category") @db.VarChar(100)
+  pickupAt                     DateTime @map("pickup_at") @db.Timestamptz
+  dropoffAt                    DateTime @map("dropoff_at") @db.Timestamptz
+  pickupLocation               String   @map("pickup_location") @db.VarChar(255)
+  dropoffLocation              String   @map("dropoff_location") @db.VarChar(255)
+  driverAge                    Int?     @map("driver_age") @db.SmallInt
+  rawProviderPayload           Json     @map("raw_provider_payload")
+  providerPayloadSchemaVersion String   @map("provider_payload_schema_version") @db.VarChar(20)
+
+  booking       Booking       @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  establishment Establishment @relation(fields: [establishmentId], references: [id], onDelete: Restrict)
+
+  @@map("car_rental_bookings")
+}
+
+model ActivityBooking {
+  id                           String   @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  bookingId                    String   @unique @map("booking_id") @db.Uuid
+  establishmentId              String?  @map("establishment_id") @db.Uuid
+  activityName                 String   @map("activity_name") @db.VarChar(200)
+  scheduledAt                  DateTime @map("scheduled_at") @db.Timestamptz
+  participantsCount            Int      @map("participants_count") @db.SmallInt
+  rawProviderPayload           Json     @map("raw_provider_payload")
+  providerPayloadSchemaVersion String   @map("provider_payload_schema_version") @db.VarChar(20)
+
+  booking       Booking        @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  establishment Establishment? @relation(fields: [establishmentId], references: [id], onDelete: SetNull)
+
+  @@map("activity_bookings")
+}
+
+model RestaurantBooking {
+  id                           String   @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  bookingId                    String   @unique @map("booking_id") @db.Uuid
+  establishmentId              String   @map("establishment_id") @db.Uuid
+  reservationAt                DateTime @map("reservation_at") @db.Timestamptz
+  partySize                    Int      @map("party_size") @db.SmallInt
+  rawProviderPayload           Json     @map("raw_provider_payload")
+  providerPayloadSchemaVersion String   @map("provider_payload_schema_version") @db.VarChar(20)
+
+  booking       Booking       @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  establishment Establishment @relation(fields: [establishmentId], references: [id], onDelete: Restrict)
+
+  @@map("restaurant_bookings")
+}
+
+model DeliveryOrder {
+  id                           String    @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  bookingId                    String    @unique @map("booking_id") @db.Uuid
+  establishmentId              String    @map("establishment_id") @db.Uuid
+  driverId                     String?   @map("driver_id") @db.Uuid
+  deliveryAddress              String    @map("delivery_address") @db.VarChar(255)
+  orderedAt                    DateTime  @map("ordered_at") @db.Timestamptz
+  deliveredAt                  DateTime? @map("delivered_at") @db.Timestamptz
+  rawProviderPayload           Json      @map("raw_provider_payload")
+  providerPayloadSchemaVersion String    @map("provider_payload_schema_version") @db.VarChar(20)
+
+  booking       Booking       @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  establishment Establishment @relation(fields: [establishmentId], references: [id], onDelete: Restrict)
+  driver        Driver?       @relation(fields: [driverId], references: [id], onDelete: SetNull)
+
+  @@map("delivery_orders")
+}
+
+model EventBooking {
+  id                           String   @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  bookingId                    String   @unique @map("booking_id") @db.Uuid
+  eventName                    String   @map("event_name") @db.VarChar(200)
+  venueEstablishmentId         String?  @map("venue_establishment_id") @db.Uuid
+  eventAt                      DateTime @map("event_at") @db.Timestamptz
+  ticketCount                  Int      @map("ticket_count") @db.SmallInt
+  seatInfo                     Json?    @map("seat_info")
+  rawProviderPayload           Json     @map("raw_provider_payload")
+  providerPayloadSchemaVersion String   @map("provider_payload_schema_version") @db.VarChar(20)
+
+  booking            Booking        @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  venueEstablishment Establishment? @relation(fields: [venueEstablishmentId], references: [id], onDelete: SetNull)
+
+  @@map("event_bookings")
+}
+
+model EsimOrder {
+  id                           String   @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  bookingId                    String   @unique @map("booking_id") @db.Uuid
+  dataPlanName                 String   @map("data_plan_name") @db.VarChar(200)
+  region                       String   @db.VarChar(100)
+  activationCode               String?  @map("activation_code")
+  validFrom                    DateTime @map("valid_from") @db.Date
+  validUntil                   DateTime @map("valid_until") @db.Date
+  rawProviderPayload           Json     @map("raw_provider_payload")
+  providerPayloadSchemaVersion String   @map("provider_payload_schema_version") @db.VarChar(20)
+
+  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+
+  @@map("esim_orders")
+}
+
+// =============================================================================
+// DÉPENSES (module Expenses) — inchangé par rapport à docs/database-design.md v2
+// =============================================================================
+
+model Expense {
+  id                   String    @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  tripId               String    @map("trip_id") @db.Uuid
+  paidBy               String    @map("paid_by") @db.Uuid
+  description          String    @db.VarChar(200)
+  amount               Decimal   @db.Decimal(12, 2)
+  currency             String    @db.Char(3)
+  exchangeRateToBase   Decimal   @default(1) @map("exchange_rate_to_base") @db.Decimal(12, 6)
+  amountInBaseCurrency Decimal   @map("amount_in_base_currency") @db.Decimal(12, 2)
+  category             String    @default("other") @db.VarChar(30)
+  expenseDate          DateTime  @map("expense_date") @db.Date
+  receiptFileId        String?   @map("receipt_file_id") @db.Uuid
+  createdAt            DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt            DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+  deletedAt            DateTime? @map("deleted_at") @db.Timestamptz
+
+  trip        Trip       @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  payer       TripMember @relation(fields: [paidBy], references: [id], onDelete: Restrict)
+  currencyRef Currency   @relation(fields: [currency], references: [code], onDelete: Restrict)
+  receiptFile File?      @relation("ExpenseReceipt", fields: [receiptFileId], references: [id])
+
+  shares ExpenseShare[]
+
+  @@index([tripId, expenseDate])
+  @@map("expenses")
+}
+
+model ExpenseShare {
+  id           String   @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  expenseId    String   @map("expense_id") @db.Uuid
+  tripMemberId String   @map("trip_member_id") @db.Uuid
+  shareAmount  Decimal  @map("share_amount") @db.Decimal(12, 2)
+  isSettled    Boolean  @default(false) @map("is_settled")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  expense    Expense    @relation(fields: [expenseId], references: [id], onDelete: Cascade)
+  tripMember TripMember @relation(fields: [tripMemberId], references: [id], onDelete: Restrict)
+
+  @@unique([expenseId, tripMemberId])
+  @@index([tripMemberId, isSettled])
+  @@map("expense_shares")
+}
+
+model Settlement {
+  id           String   @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  tripId       String   @map("trip_id") @db.Uuid
+  fromMemberId String   @map("from_member_id") @db.Uuid
+  toMemberId   String   @map("to_member_id") @db.Uuid
+  amount       Decimal  @db.Decimal(12, 2)
+  currency     String   @db.Char(3)
+  settledAt    DateTime @map("settled_at") @db.Timestamptz
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  trip        Trip       @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  fromMember  TripMember @relation("SettlementFrom", fields: [fromMemberId], references: [id], onDelete: Restrict)
+  toMember    TripMember @relation("SettlementTo", fields: [toMemberId], references: [id], onDelete: Restrict)
+  currencyRef Currency   @relation(fields: [currency], references: [code], onDelete: Restrict)
+
+  @@map("settlements")
+}
+
+/// Projection dérivée, jamais source de vérité — expense_shares reste
+/// l'unique source de vérité (garde-fou : job de réconciliation).
+model TripBalance {
+  id            String   @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  tripId        String   @map("trip_id") @db.Uuid
+  tripMemberId  String   @map("trip_member_id") @db.Uuid
+  balanceAmount Decimal  @default(0) @map("balance_amount") @db.Decimal(12, 2)
+  currency      String   @db.Char(3)
+  updatedAt     DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  trip        Trip       @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  tripMember  TripMember @relation(fields: [tripMemberId], references: [id], onDelete: Cascade)
+  currencyRef Currency   @relation(fields: [currency], references: [code], onDelete: Restrict)
+
+  @@unique([tripId, tripMemberId])
+  @@map("trip_balances")
+}
+
+// =============================================================================
+// PAIEMENTS & FINANCE (modules Payments et Wallet)
+// =============================================================================
+
+enum PaymentMethod {
+  Card   @map("card")
+  Wallet @map("wallet")
+  Mixed  @map("mixed")
+}
+
+enum PaymentStatus {
+  Pending           @map("pending")
+  Authorized        @map("authorized")
+  Captured          @map("captured")
+  Failed            @map("failed")
+  Refunded          @map("refunded")
+  PartiallyRefunded @map("partially_refunded")
+}
+
+/// Financièrement immuable : aucune colonne deleted_at, un paiement ne se
+/// supprime jamais (cf. plan §6/§7).
+model Payment {
+  id                 String        @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  bookingId          String        @map("booking_id") @db.Uuid
+  payerId            String        @map("payer_id") @db.Uuid
+  method             PaymentMethod
+  amount             Decimal       @db.Decimal(12, 2)
+  currency           String        @db.Char(3)
+  status             PaymentStatus @default(Pending)
+  provider           String        @db.VarChar(50)
+  providerReference  String?       @map("provider_reference") @db.VarChar(200)
+  idempotencyKey     String        @unique @map("idempotency_key") @db.VarChar(200)
+  rawProviderPayload Json?         @map("raw_provider_payload")
+  createdAt          DateTime      @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt          DateTime      @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  booking     Booking    @relation(fields: [bookingId], references: [id], onDelete: Restrict)
+  payer       TripMember @relation(fields: [payerId], references: [id], onDelete: Restrict)
+  currencyRef Currency   @relation(fields: [currency], references: [code], onDelete: Restrict)
+
+  refunds           Refund[]
+  commissionEntries CommissionEntry[]
+
+  @@index([payerId, createdAt])
+  @@index([bookingId])
+  @@map("payments")
+}
+
+enum RefundStatus {
+  Pending   @map("pending")
+  Processed @map("processed")
+  Failed    @map("failed")
+}
+
+model Refund {
+  id                String       @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  paymentId         String       @map("payment_id") @db.Uuid
+  amount            Decimal      @db.Decimal(12, 2)
+  currency          String       @db.Char(3)
+  reason            String?      @db.VarChar(255)
+  status            RefundStatus @default(Pending)
+  providerReference String?      @map("provider_reference") @db.VarChar(200)
+  createdAt         DateTime     @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt         DateTime     @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+  processedAt       DateTime?    @map("processed_at") @db.Timestamptz
+
+  payment     Payment  @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  currencyRef Currency @relation(fields: [currency], references: [code], onDelete: Restrict)
+
+  @@map("refunds")
+}
+
+enum CommissionRecipientType {
+  Platform @map("platform")
+  Provider @map("provider")
+  Driver   @map("driver")
+}
+
+/// rateApplied est figé au moment du calcul, jamais recalculé
+/// rétroactivement (même principe que expense_shares.share_amount).
+model CommissionEntry {
+  id            String                  @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  bookingId     String                  @map("booking_id") @db.Uuid
+  paymentId     String                  @map("payment_id") @db.Uuid
+  recipientType CommissionRecipientType @map("recipient_type")
+  recipientId   String?                 @map("recipient_id") @db.Uuid
+  rateApplied   Decimal                 @map("rate_applied") @db.Decimal(5, 4)
+  amount        Decimal                 @db.Decimal(12, 2)
+  currency      String                  @db.Char(3)
+  createdAt     DateTime                @default(now()) @map("created_at") @db.Timestamptz
+
+  booking     Booking  @relation(fields: [bookingId], references: [id], onDelete: Restrict)
+  payment     Payment  @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  currencyRef Currency @relation(fields: [currency], references: [code], onDelete: Restrict)
+
+  payoutLineItems PayoutLineItem[]
+
+  @@map("commission_entries")
+}
+
+enum PayoutRecipientType {
+  Provider @map("provider")
+  Driver   @map("driver")
+}
+
+enum PayoutStatus {
+  Pending    @map("pending")
+  Processing @map("processing")
+  Paid       @map("paid")
+  Failed     @map("failed")
+}
+
+model Payout {
+  id                     String              @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  recipientType          PayoutRecipientType @map("recipient_type")
+  recipientId            String              @map("recipient_id") @db.Uuid
+  periodStart            DateTime            @map("period_start") @db.Date
+  periodEnd              DateTime            @map("period_end") @db.Date
+  amount                 Decimal             @db.Decimal(12, 2)
+  currency               String              @db.Char(3)
+  status                 PayoutStatus        @default(Pending)
+  payoutAccountReference String              @map("payout_account_reference") @db.VarChar(200)
+  externalPayoutId       String?             @map("external_payout_id") @db.VarChar(200)
+  createdAt              DateTime            @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt              DateTime            @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+  paidAt                 DateTime?           @map("paid_at") @db.Timestamptz
+
+  currencyRef Currency         @relation(fields: [currency], references: [code], onDelete: Restrict)
+  lineItems   PayoutLineItem[]
+
+  @@map("payouts")
+}
+
+/// UNIQUE(payoutId, commissionEntryId) empêche de compter deux fois la
+/// même commission dans deux reversements différents.
+model PayoutLineItem {
+  id                String   @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  payoutId          String   @map("payout_id") @db.Uuid
+  commissionEntryId String   @map("commission_entry_id") @db.Uuid
+  amount            Decimal  @db.Decimal(12, 2)
+  createdAt         DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  payout          Payout          @relation(fields: [payoutId], references: [id], onDelete: Cascade)
+  commissionEntry CommissionEntry @relation(fields: [commissionEntryId], references: [id], onDelete: Restrict)
+
+  @@unique([payoutId, commissionEntryId])
+  @@map("payout_line_items")
+}
+
+enum InvoiceIssuedToType {
+  User     @map("user")
+  Provider @map("provider")
+}
+
+enum InvoiceStatus {
+  Draft  @map("draft")
+  Issued @map("issued")
+  Paid   @map("paid")
+  Void   @map("void")
+}
+
+/// Annulation = passage à Void, jamais de suppression (pratique comptable
+/// standard). Aucun moteur de TVA/fiscalité multi-juridiction (hors périmètre).
+model Invoice {
+  id           String              @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  issuedToType InvoiceIssuedToType @map("issued_to_type")
+  issuedToId   String              @map("issued_to_id") @db.Uuid
+  status       InvoiceStatus       @default(Draft)
+  currency     String              @db.Char(3)
+  totalAmount  Decimal             @map("total_amount") @db.Decimal(12, 2)
+  issuedAt     DateTime?           @map("issued_at") @db.Timestamptz
+  dueAt        DateTime?           @map("due_at") @db.Timestamptz
+  pdfFileId    String?             @map("pdf_file_id") @db.Uuid
+  createdAt    DateTime            @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt    DateTime            @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  currencyRef Currency @relation(fields: [currency], references: [code], onDelete: Restrict)
+  pdfFile     File?    @relation("InvoicePdf", fields: [pdfFileId], references: [id])
+
+  lineItems InvoiceLineItem[]
+
+  @@map("invoices")
+}
+
+enum InvoiceReferenceType {
+  Payment         @map("payment")
+  CommissionEntry @map("commission_entry")
+  Expense         @map("expense")
+}
+
+model InvoiceLineItem {
+  id            String                @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  invoiceId     String                @map("invoice_id") @db.Uuid
+  description   String                @db.VarChar(255)
+  amount        Decimal               @db.Decimal(12, 2)
+  referenceType InvoiceReferenceType? @map("reference_type")
+  referenceId   String?               @map("reference_id") @db.Uuid
+  createdAt     DateTime              @default(now()) @map("created_at") @db.Timestamptz
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@map("invoice_line_items")
+}
+
+/// Un portefeuille par utilisateur. `userId` en RESTRICT (et non CASCADE) :
+/// la suppression physique d'un utilisateur ne doit jamais entraîner la
+/// suppression en cascade de son wallet ni de son historique de
+/// transactions (WalletTransaction est un grand livre immuable, même
+/// traitement que AuditLog.actorId). La suppression de compte passe par un
+/// processus applicatif qui règle/transfère le solde au préalable, jamais
+/// un DELETE brut cascadé (même principe que trips.createdBy).
+model Wallet {
+  id        String   @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  userId    String   @unique @map("user_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  balances     WalletBalance[]
+  transactions WalletTransaction[]
+
+  @@map("wallets")
+}
+
+/// Projection dérivée par devise — jamais source de vérité (même
+/// garde-fou que TripBalance). Cloisonné par devise, aucune conversion en
+/// V1 (cf. plan §13 pour l'extensibilité future sans refonte).
+model WalletBalance {
+  id        String   @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  walletId  String   @map("wallet_id") @db.Uuid
+  currency  String   @db.Char(3)
+  balance   Decimal  @default(0) @db.Decimal(12, 2)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  wallet      Wallet   @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  currencyRef Currency @relation(fields: [currency], references: [code], onDelete: Restrict)
+
+  @@unique([walletId, currency])
+  @@map("wallet_balances")
+}
+
+enum WalletTransactionType {
+  Credit @map("credit")
+  Debit  @map("debit")
+}
+
+enum WalletTransactionReason {
+  TopUp          @map("top_up")
+  Payment        @map("payment")
+  Refund         @map("refund")
+  PayoutReceived @map("payout_received")
+  Adjustment     @map("adjustment")
+}
+
+enum WalletReferenceType {
+  Payment @map("payment")
+  Refund  @map("refund")
+  Payout  @map("payout")
+}
+
+/// Grand livre immuable — aucune colonne updatedAt/deletedAt (même
+/// traitement que AuditLog). `walletId` en RESTRICT (et non CASCADE) : un
+/// wallet possédant des transactions ne peut jamais être supprimé
+/// physiquement, même directement en base — il doit être clôturé ou
+/// désactivé (via un futur statut applicatif), jamais effacé. Ceci protège
+/// le grand livre d'une suppression accidentelle du wallet parent, en plus
+/// de la protection déjà apportée par Wallet.userId en RESTRICT.
+model WalletTransaction {
+  id            String                  @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  walletId      String                  @map("wallet_id") @db.Uuid
+  type          WalletTransactionType
+  amount        Decimal                 @db.Decimal(12, 2)
+  currency      String                  @db.Char(3)
+  reason        WalletTransactionReason
+  referenceType WalletReferenceType?    @map("reference_type")
+  referenceId   String?                 @map("reference_id") @db.Uuid
+  createdAt     DateTime                @default(now()) @map("created_at") @db.Timestamptz
+
+  wallet      Wallet   @relation(fields: [walletId], references: [id], onDelete: Restrict)
+  currencyRef Currency @relation(fields: [currency], references: [code], onDelete: Restrict)
+
+  @@index([walletId, createdAt])
+  @@map("wallet_transactions")
+}
+
+// =============================================================================
+// MESSAGERIE (module Messaging) — inchangé
+// =============================================================================
+
+model Conversation {
+  id        String   @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  tripId    String   @unique @map("trip_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  trip     Trip      @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  messages Message[]
+
+  @@map("conversations")
+}
+
+/// message_type reste varchar (déjà varchar en v2, inchangé, cf. plan §3).
+model Message {
+  id             String    @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  conversationId String    @map("conversation_id") @db.Uuid
+  senderId       String?   @map("sender_id") @db.Uuid
+  content        String
+  messageType    String    @default("text") @map("message_type") @db.VarChar(20)
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt      DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+  deletedAt      DateTime? @map("deleted_at") @db.Timestamptz
+
+  conversation Conversation  @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sender       User?         @relation(fields: [senderId], references: [id], onDelete: SetNull)
+  reads        MessageRead[]
+
+  @@index([conversationId, createdAt])
+  @@map("messages")
+}
+
+model MessageRead {
+  messageId String   @map("message_id") @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  readAt    DateTime @default(now()) @map("read_at") @db.Timestamptz
+
+  message Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([messageId, userId])
+  @@map("message_reads")
+}
+
+// =============================================================================
+// NOTIFICATIONS — inchangé
+// =============================================================================
+
+/// type reste varchar (déjà varchar en v2, inchangé, cf. plan §3).
+model Notification {
+  id        String    @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  type      String    @db.VarChar(50)
+  payload   Json
+  readAt    DateTime? @map("read_at") @db.Timestamptz
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt])
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("notifications")
+}
+
+model NotificationPreference {
+  id               String  @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  userId           String  @map("user_id") @db.Uuid
+  notificationType String  @map("notification_type") @db.VarChar(50)
+  channel          String  @db.VarChar(20)
+  enabled          Boolean @default(true)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, notificationType, channel])
+  @@map("notification_preferences")
+}
+
+// =============================================================================
+// ENGAGEMENT (module Engagement, nouveau) — favoris et avis
+// =============================================================================
+
+/// Déviation par rapport au plan initial (voir rapport de fin d'étape) :
+/// "activity"/"restaurant" ont été retirés de FavoriteTargetType car ils ne
+/// sont pas des tables distinctes — ce sont des Establishment.type. Un
+/// discriminant Establishment|Driver suffit ; le sous-type reste
+/// disponible via establishments.type.
+enum FavoriteTargetType {
+  Establishment @map("establishment")
+  Driver        @map("driver")
+}
+
+model Favorite {
+  id         String             @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  userId     String             @map("user_id") @db.Uuid
+  targetType FavoriteTargetType @map("target_type")
+  targetId   String             @map("target_id") @db.Uuid
+  createdAt  DateTime           @default(now()) @map("created_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, targetType, targetId])
+  @@index([userId])
+  @@map("favorites")
+}
+
+/// Même déviation que FavoriteTargetType (cf. commentaire ci-dessus).
+enum ReviewTargetType {
+  Establishment @map("establishment")
+  Driver        @map("driver")
+}
+
+/// Pattern "achat vérifié" — bookingId NOT NULL empêche les faux avis.
+/// UNIQUE(bookingId) : un avis par réservation, pas par cible (un même
+/// utilisateur peut légitimement re-séjourner et re-noter).
+model Review {
+  id         String           @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  userId     String?          @map("user_id") @db.Uuid
+  bookingId  String           @unique @map("booking_id") @db.Uuid
+  targetType ReviewTargetType @map("target_type")
+  targetId   String           @map("target_id") @db.Uuid
+  rating     Int              @db.SmallInt
+  comment    String?
+  createdAt  DateTime         @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt  DateTime         @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+  deletedAt  DateTime?        @map("deleted_at") @db.Timestamptz
+
+  user    User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Restrict)
+
+  @@index([targetType, targetId])
+  @@map("reviews")
 }
