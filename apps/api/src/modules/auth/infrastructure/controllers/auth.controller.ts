@@ -12,11 +12,11 @@ import { Throttle } from "@nestjs/throttler";
 import type { UserProfile } from "@tripplanner/shared-types";
 import type { Request } from "express";
 
+import type { JwtPayload } from "../../../../common/types/jwt-payload";
 import { GetCurrentUserUseCase } from "../../application/use-cases/get-current-user.use-case";
 import { LoginUserUseCase } from "../../application/use-cases/login-user.use-case";
 import { RegisterUserUseCase } from "../../application/use-cases/register-user.use-case";
 import type { TokenPair } from "../../domain/ports/token-generator.port";
-import type { JwtPayload } from "../adapters/jwt.strategy";
 import { JwtAuthGuard } from "../guards/jwt-auth.guard";
 
 import { LoginDto } from "./dto/login.dto";
