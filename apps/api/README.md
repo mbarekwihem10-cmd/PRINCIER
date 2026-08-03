@@ -53,9 +53,38 @@ $ pnpm run test
 # e2e tests
 $ pnpm run test:e2e
 
+# guard-only tests for the E2E database isolation (no DB connection needed)
+$ pnpm run test:e2e-safety
+
 # test coverage
 $ pnpm run test:cov
 ```
+
+### E2E database isolation
+
+Les tests E2E (`test:e2e`) ciblent une base Postgres **dédiée et distincte**
+de la base de développement, protégée par un garde-fou fail-fast
+(`test/e2e-safety/assert-safe-e2e-database.ts`).
+
+1. Provisionner la base de test une seule fois, sur la même instance
+   Postgres locale que la base de développement :
+   ```sql
+   CREATE DATABASE tripplanner_test;
+   ```
+2. Copier le gabarit puis l'ajuster si besoin :
+   ```bash
+   cp .env.test.example .env.test
+   ```
+3. `DATABASE_URL` dans `.env.test` doit obligatoirement pointer vers une
+   base dont le nom se termine par `_test`, sur un hôte strictement local
+   (`localhost` / `127.0.0.1` / `::1`), et différente de la base configurée
+   dans `.env`. Toute autre configuration est refusée avant même l'ouverture
+   d'une connexion.
+4. `pnpm run test:e2e` charge alors `.env.test` (jamais `.env`), applique les
+   migrations (`prisma migrate deploy`), nettoie la base (TRUNCATE explicite
+   des tables métier, jamais `DROP DATABASE`), sème les données de référence
+   minimales (ex. devise `EUR`), puis exécute les specs `*.e2e-spec.ts`
+   séquentiellement (`maxWorkers: 1`).
 
 ## Deployment
 

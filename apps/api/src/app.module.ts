@@ -16,7 +16,15 @@ import { UsersModule } from "./modules/users/users.module";
 // implémentation réelle, jamais avant.
 @Module({
   imports: [
-    ConfigModule.forRoot({ isGlobal: true, validate: validateEnv }),
+    ConfigModule.forRoot({
+      isGlobal: true,
+      validate: validateEnv,
+      // Étape 3 (isolation E2E) : pendant les tests, .env.test est chargé
+      // explicitement par test/setup-env.ts avant même l'import d'AppModule
+      // — ConfigModule ne doit alors jamais tenter de compléter avec .env
+      // (base de développement). Hors tests, comportement inchangé.
+      ignoreEnvFile: process.env.NODE_ENV === "test",
+    }),
     LoggerModule.forRoot(pinoConfig),
     ThrottlerModule.forRoot([{ ttl: 60_000, limit: 100 }]),
     UsersModule,
