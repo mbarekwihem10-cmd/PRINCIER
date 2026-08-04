@@ -31,4 +31,6 @@ export interface TripDetails {
   createdAt: string;
   updatedAt: string;
   members: TripMemberView[];
+  callerRole: TripMemberRole;
+  callerStatus: TripMemberStatus;
 }
