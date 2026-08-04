@@ -101,14 +101,38 @@ export class PrismaTripRepository implements TripRepositoryPort {
     return trips.map(toDomainTrip);
   }
 
-  // Not implemented: write-side methods are out of scope for Lot 5B.1
-  // (read-only mapping). Scheduled for Lot 5B.2. Never exercised by any test.
+  async createWithOwner(data: CreateTripData): Promise<Trip> {
+    const joinedAt = new Date();
 
-  createWithOwner(_data: CreateTripData): Promise<Trip> {
-    return Promise.reject(
-      new Error("PrismaTripRepository.createWithOwner is not implemented yet"),
-    );
+    const trip = await this.prisma.trip.create({
+      data: {
+        name: data.name,
+        description: data.description,
+        destination: data.destination,
+        startDate: data.dateRange.startDate,
+        endDate: data.dateRange.endDate,
+        baseCurrency: data.baseCurrency,
+        status: "Planning",
+        createdBy: data.createdBy,
+        members: {
+          create: {
+            userId: data.createdBy,
+            role: "Owner",
+            status: "Accepted",
+            invitedBy: null,
+            joinedAt,
+          },
+        },
+      },
+      include: MEMBERS_INCLUDE_ORDERED_BY_CREATED_AT,
+    });
+
+    return toDomainTrip(trip);
   }
+
+  // Not implemented: write-side methods are out of scope for Lot 5B.2a
+  // (createWithOwner only). Scheduled for later 5B.2 sub-steps. Never
+  // exercised by any test.
 
   updateDetails(_tripId: string, _data: UpdateTripData): Promise<Trip> {
     return Promise.reject(

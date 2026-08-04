@@ -1,6 +1,8 @@
 import type { Prisma } from "@prisma/client";
 
 import type { PrismaService } from "../../../../common/prisma/prisma.service";
+import type { CreateTripData } from "../../domain/ports/trip.repository.port";
+import { TripDateRange } from "../../domain/value-objects/trip-date-range.value-object";
 
 import { PrismaTripRepository } from "./prisma-trip.repository";
 
@@ -258,6 +260,193 @@ describe("PrismaTripRepository", () => {
         "owner-1",
         "user-1",
       ]);
+    });
+  });
+
+  describe("createWithOwner", () => {
+    function buildCreateTripData(
+      overrides: Partial<CreateTripData> = {},
+    ): CreateTripData {
+      return {
+        name: "Summer trip",
+        description: null,
+        destination: "Lisbon",
+        dateRange: TripDateRange.create(
+          new Date("2026-07-01T00:00:00.000Z"),
+          new Date("2026-07-10T00:00:00.000Z"),
+        ),
+        baseCurrency: "EUR",
+        createdBy: "owner-1",
+        ...overrides,
+      };
+    }
+
+    function buildCreatedPrismaTrip(
+      overrides: Partial<MockPrismaTrip> = {},
+    ): MockPrismaTrip {
+      return buildPrismaTrip({
+        status: "Planning",
+        members: [{ ...OWNER_MEMBER, id: "member-owner-new" }],
+        ...overrides,
+      });
+    }
+
+    function buildCreateHarness(): {
+      repository: PrismaTripRepository;
+      createMock: jest.Mock<Promise<MockPrismaTrip>, [Prisma.TripCreateArgs]>;
+      transactionMock: jest.Mock;
+    } {
+      const createMock = jest.fn<
+        Promise<MockPrismaTrip>,
+        [Prisma.TripCreateArgs]
+      >();
+      const transactionMock = jest.fn();
+      const prismaStub = {
+        trip: { create: createMock },
+        $transaction: transactionMock,
+      };
+      const repository = new PrismaTripRepository(
+        prismaStub as unknown as PrismaService,
+      );
+      return { repository, createMock, transactionMock };
+    }
+
+    it("calls prisma.trip.create exactly once", async () => {
+      const { repository, createMock } = buildCreateHarness();
+      createMock.mockResolvedValue(buildCreatedPrismaTrip());
+
+      await repository.createWithOwner(buildCreateTripData());
+
+      expect(createMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("maps CreateTripData scalar fields into the create data", async () => {
+      const { repository, createMock } = buildCreateHarness();
+      createMock.mockResolvedValue(buildCreatedPrismaTrip());
+      const data = buildCreateTripData({ description: "A trip to remember" });
+
+      await repository.createWithOwner(data);
+
+      const callArgs = createMock.mock.calls[0]?.[0];
+      if (!callArgs) {
+        throw new Error("test setup failed: create was not called");
+      }
+      expect(callArgs.data.name).toBe("Summer trip");
+      expect(callArgs.data.description).toBe("A trip to remember");
+      expect(callArgs.data.destination).toBe("Lisbon");
+      expect(callArgs.data.baseCurrency).toBe("EUR");
+      expect(callArgs.data.createdBy).toBe("owner-1");
+    });
+
+    it("converts dateRange into startDate and endDate", async () => {
+      const { repository, createMock } = buildCreateHarness();
+      createMock.mockResolvedValue(buildCreatedPrismaTrip());
+      const data = buildCreateTripData();
+
+      await repository.createWithOwner(data);
+
+      const callArgs = createMock.mock.calls[0]?.[0];
+      if (!callArgs) {
+        throw new Error("test setup failed: create was not called");
+      }
+      expect(callArgs.data.startDate).toEqual(data.dateRange.startDate);
+      expect(callArgs.data.endDate).toEqual(data.dateRange.endDate);
+    });
+
+    it("forces the trip status to 'Planning'", async () => {
+      const { repository, createMock } = buildCreateHarness();
+      createMock.mockResolvedValue(buildCreatedPrismaTrip());
+
+      await repository.createWithOwner(buildCreateTripData());
+
+      const callArgs = createMock.mock.calls[0]?.[0];
+      if (!callArgs) {
+        throw new Error("test setup failed: create was not called");
+      }
+      expect(callArgs.data.status).toBe("Planning");
+    });
+
+    it("creates a nested Owner member with status Accepted", async () => {
+      const { repository, createMock } = buildCreateHarness();
+      createMock.mockResolvedValue(buildCreatedPrismaTrip());
+      const data = buildCreateTripData({ createdBy: "owner-42" });
+
+      await repository.createWithOwner(data);
+
+      const callArgs = createMock.mock.calls[0]?.[0];
+      const nestedCreate = callArgs?.data.members?.create;
+      if (!nestedCreate || Array.isArray(nestedCreate)) {
+        throw new Error(
+          "test setup failed: expected a single nested member create",
+        );
+      }
+      expect(nestedCreate.userId).toBe("owner-42");
+      expect(nestedCreate.role).toBe("Owner");
+      expect(nestedCreate.status).toBe("Accepted");
+    });
+
+    it("sets invitedBy to null and joinedAt to a Date on the nested member", async () => {
+      const { repository, createMock } = buildCreateHarness();
+      createMock.mockResolvedValue(buildCreatedPrismaTrip());
+
+      await repository.createWithOwner(buildCreateTripData());
+
+      const callArgs = createMock.mock.calls[0]?.[0];
+      const nestedCreate = callArgs?.data.members?.create;
+      if (!nestedCreate || Array.isArray(nestedCreate)) {
+        throw new Error(
+          "test setup failed: expected a single nested member create",
+        );
+      }
+      expect(nestedCreate.invitedBy).toBeNull();
+      expect(nestedCreate.joinedAt).toBeInstanceOf(Date);
+    });
+
+    it("includes members ordered by createdAt ascending", async () => {
+      const { repository, createMock } = buildCreateHarness();
+      createMock.mockResolvedValue(buildCreatedPrismaTrip());
+
+      await repository.createWithOwner(buildCreateTripData());
+
+      const callArgs = createMock.mock.calls[0]?.[0];
+      expect(callArgs?.include).toEqual({
+        members: { orderBy: { createdAt: "asc" } },
+      });
+    });
+
+    it("maps the Prisma result into a Domain Trip with its Owner member", async () => {
+      const { repository, createMock } = buildCreateHarness();
+      createMock.mockResolvedValue(
+        buildCreatedPrismaTrip({ id: "trip-new", name: "Summer trip" }),
+      );
+
+      const result = await repository.createWithOwner(buildCreateTripData());
+
+      expect(result.id).toBe("trip-new");
+      expect(result.name).toBe("Summer trip");
+      expect(result.status).toBe("Planning");
+      expect(result.members).toHaveLength(1);
+      expect(result.members[0]?.role).toBe("Owner");
+      expect(result.members[0]?.status).toBe("Accepted");
+    });
+
+    it("propagates a Prisma error unchanged", async () => {
+      const { repository, createMock } = buildCreateHarness();
+      const simulatedError = new Error("simulated P2003 foreign key violation");
+      createMock.mockRejectedValue(simulatedError);
+
+      await expect(
+        repository.createWithOwner(buildCreateTripData()),
+      ).rejects.toBe(simulatedError);
+    });
+
+    it("never calls $transaction", async () => {
+      const { repository, createMock, transactionMock } = buildCreateHarness();
+      createMock.mockResolvedValue(buildCreatedPrismaTrip());
+
+      await repository.createWithOwner(buildCreateTripData());
+
+      expect(transactionMock).not.toHaveBeenCalled();
     });
   });
 });
