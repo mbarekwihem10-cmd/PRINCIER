@@ -189,15 +189,22 @@ export class PrismaTripRepository implements TripRepositoryPort {
     }
   }
 
-  // Not implemented: write-side methods are out of scope for Lot 5B.2b
-  // (createWithOwner, updateDetails, updateStatus only). Scheduled for
-  // later 5B.2 sub-steps. Never exercised by any test.
+  async softDelete(tripId: string): Promise<void> {
+    const deletedAt = new Date();
 
-  softDelete(_tripId: string): Promise<void> {
-    return Promise.reject(
-      new Error("PrismaTripRepository.softDelete is not implemented yet"),
-    );
+    await this.prisma.trip.updateMany({
+      where: {
+        id: tripId,
+        deletedAt: null,
+      },
+      data: {
+        deletedAt,
+      },
+    });
   }
+
+  // Remaining member write-side methods are not implemented yet.
+  // Scheduled for later Lot 5B.2 sub-steps. Never exercised by any test.
 
   upsertMember(_tripId: string, _data: UpsertTripMemberData): Promise<Trip> {
     return Promise.reject(

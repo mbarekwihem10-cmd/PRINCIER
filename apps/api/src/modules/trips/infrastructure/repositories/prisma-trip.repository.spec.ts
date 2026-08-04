@@ -789,4 +789,188 @@ describe("PrismaTripRepository", () => {
       );
     });
   });
+
+  describe("softDelete", () => {
+    type UpdateManyMock = jest.Mock<
+      Promise<Prisma.BatchPayload>,
+      [Prisma.TripUpdateManyArgs]
+    >;
+
+    function buildSoftDeleteHarness(): {
+      repository: PrismaTripRepository;
+      updateManyMock: UpdateManyMock;
+      findUniqueMock: jest.Mock;
+      findFirstMock: jest.Mock;
+      findManyMock: jest.Mock;
+      transactionMock: jest.Mock;
+    } {
+      const updateManyMock = jest.fn<
+        Promise<Prisma.BatchPayload>,
+        [Prisma.TripUpdateManyArgs]
+      >();
+      const findUniqueMock = jest.fn();
+      const findFirstMock = jest.fn();
+      const findManyMock = jest.fn();
+      const transactionMock = jest.fn();
+      const prismaStub = {
+        trip: {
+          updateMany: updateManyMock,
+          findUnique: findUniqueMock,
+          findFirst: findFirstMock,
+          findMany: findManyMock,
+        },
+        $transaction: transactionMock,
+      };
+      const repository = new PrismaTripRepository(
+        prismaStub as unknown as PrismaService,
+      );
+      return {
+        repository,
+        updateManyMock,
+        findUniqueMock,
+        findFirstMock,
+        findManyMock,
+        transactionMock,
+      };
+    }
+
+    it("calls trip.updateMany exactly once", async () => {
+      const { repository, updateManyMock } = buildSoftDeleteHarness();
+      updateManyMock.mockResolvedValue({ count: 1 });
+
+      await repository.softDelete("trip-1");
+
+      expect(updateManyMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("uses where: { id: tripId, deletedAt: null }", async () => {
+      const { repository, updateManyMock } = buildSoftDeleteHarness();
+      updateManyMock.mockResolvedValue({ count: 1 });
+
+      await repository.softDelete("trip-1");
+
+      const callArgs = updateManyMock.mock.calls[0]?.[0];
+      if (!callArgs) {
+        throw new Error("test setup failed: updateMany was not called");
+      }
+      expect(callArgs.where).toEqual({ id: "trip-1", deletedAt: null });
+    });
+
+    it("transmits data containing only the 'deletedAt' key", async () => {
+      const { repository, updateManyMock } = buildSoftDeleteHarness();
+      updateManyMock.mockResolvedValue({ count: 1 });
+
+      await repository.softDelete("trip-1");
+
+      const callArgs = updateManyMock.mock.calls[0]?.[0];
+      if (!callArgs) {
+        throw new Error("test setup failed: updateMany was not called");
+      }
+      expect(Object.keys(callArgs.data)).toEqual(["deletedAt"]);
+    });
+
+    it("sets data.deletedAt to an instance of Date", async () => {
+      const { repository, updateManyMock } = buildSoftDeleteHarness();
+      updateManyMock.mockResolvedValue({ count: 1 });
+
+      await repository.softDelete("trip-1");
+
+      const callArgs = updateManyMock.mock.calls[0]?.[0];
+      if (!callArgs) {
+        throw new Error("test setup failed: updateMany was not called");
+      }
+      expect(callArgs.data.deletedAt).toBeInstanceOf(Date);
+    });
+
+    it("resolves undefined when Prisma reports count: 1", async () => {
+      const { repository, updateManyMock } = buildSoftDeleteHarness();
+      updateManyMock.mockResolvedValue({ count: 1 });
+
+      await expect(repository.softDelete("trip-1")).resolves.toBeUndefined();
+    });
+
+    it("resolves undefined when Prisma reports count: 0", async () => {
+      const { repository, updateManyMock } = buildSoftDeleteHarness();
+      updateManyMock.mockResolvedValue({ count: 0 });
+
+      await expect(repository.softDelete("trip-1")).resolves.toBeUndefined();
+    });
+
+    it("never exposes the BatchPayload's count to the caller", async () => {
+      const { repository, updateManyMock } = buildSoftDeleteHarness();
+      updateManyMock.mockResolvedValue({ count: 1 });
+
+      const result = await repository.softDelete("trip-1");
+
+      expect(result).toBeUndefined();
+    });
+
+    it("propagates an unexpected error with the same reference", async () => {
+      const { repository, updateManyMock } = buildSoftDeleteHarness();
+      const otherError = new Error("connection lost");
+      updateManyMock.mockRejectedValue(otherError);
+
+      await expect(repository.softDelete("trip-1")).rejects.toBe(otherError);
+    });
+
+    it("never calls any read method (findUnique, findFirst, findMany)", async () => {
+      const {
+        repository,
+        updateManyMock,
+        findUniqueMock,
+        findFirstMock,
+        findManyMock,
+      } = buildSoftDeleteHarness();
+      updateManyMock.mockResolvedValue({ count: 1 });
+
+      await repository.softDelete("trip-1");
+
+      expect(findUniqueMock).not.toHaveBeenCalled();
+      expect(findFirstMock).not.toHaveBeenCalled();
+      expect(findManyMock).not.toHaveBeenCalled();
+    });
+
+    it("never calls $transaction", async () => {
+      const { repository, updateManyMock, transactionMock } =
+        buildSoftDeleteHarness();
+      updateManyMock.mockResolvedValue({ count: 1 });
+
+      await repository.softDelete("trip-1");
+
+      expect(transactionMock).not.toHaveBeenCalled();
+    });
+
+    it("makes no second Prisma call after updateMany", async () => {
+      const {
+        repository,
+        updateManyMock,
+        findUniqueMock,
+        findFirstMock,
+        findManyMock,
+        transactionMock,
+      } = buildSoftDeleteHarness();
+      updateManyMock.mockResolvedValue({ count: 1 });
+
+      await repository.softDelete("trip-1");
+
+      expect(updateManyMock).toHaveBeenCalledTimes(1);
+      expect(findUniqueMock).toHaveBeenCalledTimes(0);
+      expect(findFirstMock).toHaveBeenCalledTimes(0);
+      expect(findManyMock).toHaveBeenCalledTimes(0);
+      expect(transactionMock).toHaveBeenCalledTimes(0);
+    });
+
+    it("does not provide an 'updatedAt' field in data", async () => {
+      const { repository, updateManyMock } = buildSoftDeleteHarness();
+      updateManyMock.mockResolvedValue({ count: 1 });
+
+      await repository.softDelete("trip-1");
+
+      const callArgs = updateManyMock.mock.calls[0]?.[0];
+      if (!callArgs) {
+        throw new Error("test setup failed: updateMany was not called");
+      }
+      expect(callArgs.data).not.toHaveProperty("updatedAt");
+    });
+  });
 });
