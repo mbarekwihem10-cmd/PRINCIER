@@ -30,6 +30,7 @@ export interface CreateTripData {
 export interface UpsertTripMemberData {
   readonly userId: string;
   readonly invitedBy: string;
+  readonly role?: TripMemberRole;
 }
 
 export interface TripRepositoryPort {

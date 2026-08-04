@@ -228,12 +228,15 @@ export class InMemoryTripRepository implements TripRepositoryPort {
         existing.status = "Invited";
         existing.joinedAt = null;
         existing.invitedBy = data.invitedBy;
+        if (data.role !== undefined) {
+          existing.role = data.role;
+        }
       } else {
         this.members.push({
           id: this.generateMemberId(),
           tripId,
           userId: data.userId,
-          role: "Member",
+          role: data.role ?? "Member",
           status: "Invited",
           invitedBy: data.invitedBy,
           joinedAt: null,

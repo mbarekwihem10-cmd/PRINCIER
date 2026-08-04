@@ -455,6 +455,100 @@ describe("InMemoryTripRepository", () => {
       expect(member?.role).toBe("Editor");
     });
 
+    it("creates a new member with the explicit role from data.role", async () => {
+      const created = await repository.createWithOwner(
+        buildCreateTripData({ createdBy: "owner-1" }),
+      );
+
+      const updated = await repository.upsertMember(created.id, {
+        userId: "invitee-1",
+        invitedBy: "owner-1",
+        role: "Editor",
+      });
+
+      const member = updated.members.find((m) => m.userId === "invitee-1");
+      expect(member?.role).toBe("Editor");
+    });
+
+    it("reinvitation with an explicit role replaces the previous role", async () => {
+      const created = await repository.createWithOwner(
+        buildCreateTripData({ createdBy: "owner-1" }),
+      );
+      await repository.upsertMember(created.id, {
+        userId: "invitee-1",
+        invitedBy: "owner-1",
+      });
+      const afterInvite = await repository.findById(created.id);
+      const member = afterInvite?.members.find(
+        (candidate) => candidate.userId === "invitee-1",
+      );
+
+      if (!member) {
+        throw new Error("test setup failed: invited member not found");
+      }
+
+      const memberId = member.id;
+      await repository.updateMemberRole(created.id, memberId, "Editor");
+      await repository.updateMemberStatus(
+        created.id,
+        memberId,
+        "Removed",
+        null,
+      );
+
+      const reinvited = await repository.upsertMember(created.id, {
+        userId: "invitee-1",
+        invitedBy: "owner-2",
+        role: "Member",
+      });
+
+      const reinvitedMember = reinvited.members.find(
+        (candidate) => candidate.userId === "invitee-1",
+      );
+      expect(reinvitedMember?.role).toBe("Member");
+    });
+
+    it("reinvitation with an explicit role still resets status, joinedAt, and invitedBy", async () => {
+      const created = await repository.createWithOwner(
+        buildCreateTripData({ createdBy: "owner-1" }),
+      );
+      await repository.upsertMember(created.id, {
+        userId: "invitee-1",
+        invitedBy: "owner-1",
+      });
+      const afterInvite = await repository.findById(created.id);
+      const member = afterInvite?.members.find(
+        (candidate) => candidate.userId === "invitee-1",
+      );
+
+      if (!member) {
+        throw new Error("test setup failed: invited member not found");
+      }
+
+      const memberId = member.id;
+      await repository.updateMemberRole(created.id, memberId, "Editor");
+      await repository.updateMemberStatus(
+        created.id,
+        memberId,
+        "Accepted",
+        new Date("2026-01-15T00:00:00.000Z"),
+      );
+
+      const reinvited = await repository.upsertMember(created.id, {
+        userId: "invitee-1",
+        invitedBy: "owner-2",
+        role: "Member",
+      });
+
+      const reinvitedMember = reinvited.members.find(
+        (candidate) => candidate.userId === "invitee-1",
+      );
+      expect(reinvitedMember?.role).toBe("Member");
+      expect(reinvitedMember?.status).toBe("Invited");
+      expect(reinvitedMember?.joinedAt).toBeNull();
+      expect(reinvitedMember?.invitedBy).toBe("owner-2");
+    });
+
     it("does not create a duplicate after several successive upserts", async () => {
       const created = await repository.createWithOwner(
         buildCreateTripData({ createdBy: "owner-1" }),

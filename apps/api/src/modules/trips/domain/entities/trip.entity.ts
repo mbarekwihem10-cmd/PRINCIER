@@ -6,6 +6,7 @@ import type {
 } from "@tripplanner/shared-types";
 
 import { CannotRemoveLastOwnerError } from "../cannot-remove-last-owner.error";
+import { CannotRemoveSelfError } from "../cannot-remove-self.error";
 import { DuplicateTripMemberError } from "../duplicate-trip-member.error";
 import { InsufficientTripRoleError } from "../insufficient-trip-role.error";
 import { InvalidMemberStatusTransitionError } from "../invalid-member-status-transition.error";
@@ -195,15 +196,11 @@ export class Trip {
   removeMember(actorId: string, memberId: string): void {
     this.assertManageableBy(actorId);
     const target = this.requireMemberById(memberId);
+    if (target.userId === actorId) {
+      throw new CannotRemoveSelfError(this.props.id);
+    }
     if (target.status === "Removed") {
       return;
-    }
-    if (
-      target.isOwner() &&
-      target.isAccepted() &&
-      this.countAcceptedOwners() <= 1
-    ) {
-      throw new CannotRemoveLastOwnerError(this.props.id);
     }
     this.replaceMember(target.withStatus("Removed", null));
   }

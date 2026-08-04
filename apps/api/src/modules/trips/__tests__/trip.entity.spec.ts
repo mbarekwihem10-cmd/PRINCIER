@@ -1,6 +1,7 @@
 import type { TripMemberRole } from "@tripplanner/shared-types";
 
 import { CannotRemoveLastOwnerError } from "../domain/cannot-remove-last-owner.error";
+import { CannotRemoveSelfError } from "../domain/cannot-remove-self.error";
 import { DuplicateTripMemberError } from "../domain/duplicate-trip-member.error";
 import {
   TripMember,
@@ -435,6 +436,18 @@ describe("Trip — removeMember", () => {
     );
   });
 
+  it("transitions a Declined target to Removed", () => {
+    const trip = buildTrip({
+      members: membersOf(ownerProps(), memberProps({ status: "Declined" })),
+    });
+
+    trip.removeMember(OWNER_ID, "tm-member");
+
+    expect(trip.members.find((m) => m.id === "tm-member")?.status).toBe(
+      "Removed",
+    );
+  });
+
   it("throws TripMemberNotFoundError for an unknown memberId", () => {
     const trip = buildTrip();
     expect(() => trip.removeMember(OWNER_ID, "unknown-id")).toThrow(
@@ -451,10 +464,19 @@ describe("Trip — removeMember", () => {
     );
   });
 
-  it("throws CannotRemoveLastOwnerError when the target is the sole Accepted Owner", () => {
+  it("throws CannotRemoveSelfError when the sole Accepted Owner targets their own membership row", () => {
     const trip = buildTrip();
     expect(() => trip.removeMember(OWNER_ID, "tm-owner")).toThrow(
-      CannotRemoveLastOwnerError,
+      CannotRemoveSelfError,
+    );
+  });
+
+  it("throws CannotRemoveSelfError even when other Accepted Owners exist", () => {
+    const secondOwner = ownerProps({ id: "tm-owner-2", userId: "owner-2" });
+    const trip = buildTrip({ members: membersOf(ownerProps(), secondOwner) });
+
+    expect(() => trip.removeMember(OWNER_ID, "tm-owner")).toThrow(
+      CannotRemoveSelfError,
     );
   });
 
@@ -479,7 +501,7 @@ describe("Trip — removeMember", () => {
     );
   });
 
-  it("does not trigger the last-owner protection for an Invited (not yet accepted) Owner", () => {
+  it("successfully removes an Invited (not yet accepted) Owner", () => {
     const invitedOwner = ownerProps({
       id: "tm-owner-2",
       userId: "owner-2",
