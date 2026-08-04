@@ -1,7 +1,9 @@
-import type { Prisma } from "@prisma/client";
+import { Prisma } from "@prisma/client";
 
 import type { PrismaService } from "../../../../common/prisma/prisma.service";
+import type { UpdateTripData } from "../../domain/entities/trip.entity";
 import type { CreateTripData } from "../../domain/ports/trip.repository.port";
+import { TripNotFoundError } from "../../domain/trip-not-found.error";
 import { TripDateRange } from "../../domain/value-objects/trip-date-range.value-object";
 
 import { PrismaTripRepository } from "./prisma-trip.repository";
@@ -447,6 +449,344 @@ describe("PrismaTripRepository", () => {
       await repository.createWithOwner(buildCreateTripData());
 
       expect(transactionMock).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("updateDetails", () => {
+    type UpdateMock = jest.Mock<
+      Promise<MockPrismaTrip>,
+      [Prisma.TripUpdateArgs]
+    >;
+
+    function buildUpdateHarness(): {
+      repository: PrismaTripRepository;
+      updateMock: UpdateMock;
+    } {
+      const updateMock = jest.fn<
+        Promise<MockPrismaTrip>,
+        [Prisma.TripUpdateArgs]
+      >();
+      const prismaStub = { trip: { update: updateMock } };
+      const repository = new PrismaTripRepository(
+        prismaStub as unknown as PrismaService,
+      );
+      return { repository, updateMock };
+    }
+
+    it("transmits only 'name' when only name is provided", async () => {
+      const { repository, updateMock } = buildUpdateHarness();
+      updateMock.mockResolvedValue(buildPrismaTrip());
+
+      await repository.updateDetails("trip-1", { name: "New name" });
+
+      const callArgs = updateMock.mock.calls[0]?.[0];
+      if (!callArgs) {
+        throw new Error("test setup failed: update was not called");
+      }
+      expect(callArgs.data).toEqual({ name: "New name" });
+    });
+
+    it("transmits only 'description' when set to a string", async () => {
+      const { repository, updateMock } = buildUpdateHarness();
+      updateMock.mockResolvedValue(buildPrismaTrip());
+
+      await repository.updateDetails("trip-1", { description: "New desc" });
+
+      const callArgs = updateMock.mock.calls[0]?.[0];
+      if (!callArgs) {
+        throw new Error("test setup failed: update was not called");
+      }
+      expect(callArgs.data).toEqual({ description: "New desc" });
+    });
+
+    it("transmits description: null explicitly", async () => {
+      const { repository, updateMock } = buildUpdateHarness();
+      updateMock.mockResolvedValue(buildPrismaTrip());
+
+      await repository.updateDetails("trip-1", { description: null });
+
+      const callArgs = updateMock.mock.calls[0]?.[0];
+      if (!callArgs) {
+        throw new Error("test setup failed: update was not called");
+      }
+      expect(callArgs.data).toEqual({ description: null });
+    });
+
+    it("transmits only 'destination' when set to a string", async () => {
+      const { repository, updateMock } = buildUpdateHarness();
+      updateMock.mockResolvedValue(buildPrismaTrip());
+
+      await repository.updateDetails("trip-1", { destination: "Porto" });
+
+      const callArgs = updateMock.mock.calls[0]?.[0];
+      if (!callArgs) {
+        throw new Error("test setup failed: update was not called");
+      }
+      expect(callArgs.data).toEqual({ destination: "Porto" });
+    });
+
+    it("transmits destination: null explicitly", async () => {
+      const { repository, updateMock } = buildUpdateHarness();
+      updateMock.mockResolvedValue(buildPrismaTrip());
+
+      await repository.updateDetails("trip-1", { destination: null });
+
+      const callArgs = updateMock.mock.calls[0]?.[0];
+      if (!callArgs) {
+        throw new Error("test setup failed: update was not called");
+      }
+      expect(callArgs.data).toEqual({ destination: null });
+    });
+
+    it("converts dateRange into startDate and endDate together", async () => {
+      const { repository, updateMock } = buildUpdateHarness();
+      updateMock.mockResolvedValue(buildPrismaTrip());
+      const dateRange = TripDateRange.create(
+        new Date("2026-06-01T00:00:00.000Z"),
+        new Date("2026-06-10T00:00:00.000Z"),
+      );
+
+      await repository.updateDetails("trip-1", { dateRange });
+
+      const callArgs = updateMock.mock.calls[0]?.[0];
+      if (!callArgs) {
+        throw new Error("test setup failed: update was not called");
+      }
+      expect(callArgs.data).toEqual({
+        startDate: dateRange.startDate,
+        endDate: dateRange.endDate,
+      });
+    });
+
+    it("transmits null startDate and endDate when dateRange clears both bounds", async () => {
+      const { repository, updateMock } = buildUpdateHarness();
+      updateMock.mockResolvedValue(buildPrismaTrip());
+      const dateRange = TripDateRange.create(null, null);
+
+      await repository.updateDetails("trip-1", { dateRange });
+
+      const callArgs = updateMock.mock.calls[0]?.[0];
+      if (!callArgs) {
+        throw new Error("test setup failed: update was not called");
+      }
+      expect(callArgs.data).toEqual({ startDate: null, endDate: null });
+    });
+
+    it("transmits only 'baseCurrency' when provided alone", async () => {
+      const { repository, updateMock } = buildUpdateHarness();
+      updateMock.mockResolvedValue(buildPrismaTrip());
+
+      await repository.updateDetails("trip-1", { baseCurrency: "USD" });
+
+      const callArgs = updateMock.mock.calls[0]?.[0];
+      if (!callArgs) {
+        throw new Error("test setup failed: update was not called");
+      }
+      expect(callArgs.data).toEqual({ baseCurrency: "USD" });
+    });
+
+    it("transmits multiple fields together", async () => {
+      const { repository, updateMock } = buildUpdateHarness();
+      updateMock.mockResolvedValue(buildPrismaTrip());
+
+      await repository.updateDetails("trip-1", {
+        name: "New name",
+        baseCurrency: "USD",
+      });
+
+      const callArgs = updateMock.mock.calls[0]?.[0];
+      if (!callArgs) {
+        throw new Error("test setup failed: update was not called");
+      }
+      expect(callArgs.data).toEqual({ name: "New name", baseCurrency: "USD" });
+    });
+
+    it("omits fields that are not provided", async () => {
+      const { repository, updateMock } = buildUpdateHarness();
+      updateMock.mockResolvedValue(buildPrismaTrip());
+
+      await repository.updateDetails("trip-1", { name: "Only name" });
+
+      const callArgs = updateMock.mock.calls[0]?.[0];
+      if (!callArgs) {
+        throw new Error("test setup failed: update was not called");
+      }
+      expect(callArgs.data).not.toHaveProperty("description");
+      expect(callArgs.data).not.toHaveProperty("destination");
+      expect(callArgs.data).not.toHaveProperty("baseCurrency");
+      expect(callArgs.data).not.toHaveProperty("startDate");
+      expect(callArgs.data).not.toHaveProperty("endDate");
+    });
+
+    it("transmits an empty data object for an empty UpdateTripData", async () => {
+      const { repository, updateMock } = buildUpdateHarness();
+      updateMock.mockResolvedValue(buildPrismaTrip());
+      const emptyData: UpdateTripData = {};
+
+      await repository.updateDetails("trip-1", emptyData);
+
+      const callArgs = updateMock.mock.calls[0]?.[0];
+      if (!callArgs) {
+        throw new Error("test setup failed: update was not called");
+      }
+      expect(callArgs.data).toEqual({});
+    });
+
+    it("includes members ordered by createdAt ascending", async () => {
+      const { repository, updateMock } = buildUpdateHarness();
+      updateMock.mockResolvedValue(buildPrismaTrip());
+
+      await repository.updateDetails("trip-1", { name: "New name" });
+
+      const callArgs = updateMock.mock.calls[0]?.[0];
+      expect(callArgs?.include).toEqual({
+        members: { orderBy: { createdAt: "asc" } },
+      });
+    });
+
+    it("maps the Prisma result into a Domain Trip", async () => {
+      const { repository, updateMock } = buildUpdateHarness();
+      updateMock.mockResolvedValue(buildPrismaTrip({ name: "Updated name" }));
+
+      const result = await repository.updateDetails("trip-1", {
+        name: "Updated name",
+      });
+
+      expect(result.name).toBe("Updated name");
+      expect(result.members).toHaveLength(1);
+    });
+
+    it("translates a simulated P2025 into TripNotFoundError with the given tripId", async () => {
+      const { repository, updateMock } = buildUpdateHarness();
+      const notFoundError = new Prisma.PrismaClientKnownRequestError(
+        "An operation failed because it depends on one or more records that were required but not found.",
+        { code: "P2025", clientVersion: "6.19.3" },
+      );
+      updateMock.mockRejectedValue(notFoundError);
+
+      await expect(
+        repository.updateDetails("unknown-trip", { name: "New name" }),
+      ).rejects.toThrow(new TripNotFoundError("unknown-trip"));
+    });
+
+    it("propagates a non-P2025 error unchanged", async () => {
+      const { repository, updateMock } = buildUpdateHarness();
+      const otherError = new Error("connection lost");
+      updateMock.mockRejectedValue(otherError);
+
+      await expect(
+        repository.updateDetails("trip-1", { name: "New name" }),
+      ).rejects.toBe(otherError);
+    });
+
+    it("propagates a simulated P2003 without translating it into TripNotFoundError or InvalidBaseCurrencyError", async () => {
+      const { repository, updateMock } = buildUpdateHarness();
+      const foreignKeyError = new Prisma.PrismaClientKnownRequestError(
+        "Foreign key constraint failed on the field: `trips_base_currency_fkey`",
+        {
+          code: "P2003",
+          clientVersion: "6.19.3",
+          meta: { constraint: "trips_base_currency_fkey" },
+        },
+      );
+      updateMock.mockRejectedValue(foreignKeyError);
+
+      await expect(
+        repository.updateDetails("trip-1", { baseCurrency: "XXX" }),
+      ).rejects.toBe(foreignKeyError);
+    });
+  });
+
+  describe("updateStatus", () => {
+    type UpdateMock = jest.Mock<
+      Promise<MockPrismaTrip>,
+      [Prisma.TripUpdateArgs]
+    >;
+
+    function buildUpdateStatusHarness(): {
+      repository: PrismaTripRepository;
+      updateMock: UpdateMock;
+    } {
+      const updateMock = jest.fn<
+        Promise<MockPrismaTrip>,
+        [Prisma.TripUpdateArgs]
+      >();
+      const prismaStub = { trip: { update: updateMock } };
+      const repository = new PrismaTripRepository(
+        prismaStub as unknown as PrismaService,
+      );
+      return { repository, updateMock };
+    }
+
+    it("calls update with where: { id: tripId }", async () => {
+      const { repository, updateMock } = buildUpdateStatusHarness();
+      updateMock.mockResolvedValue(buildPrismaTrip({ status: "Archived" }));
+
+      await repository.updateStatus("trip-1", "Archived");
+
+      const callArgs = updateMock.mock.calls[0]?.[0];
+      if (!callArgs) {
+        throw new Error("test setup failed: update was not called");
+      }
+      expect(callArgs.where).toEqual({ id: "trip-1" });
+    });
+
+    it("transmits data: { status } exactly", async () => {
+      const { repository, updateMock } = buildUpdateStatusHarness();
+      updateMock.mockResolvedValue(buildPrismaTrip({ status: "Archived" }));
+
+      await repository.updateStatus("trip-1", "Archived");
+
+      const callArgs = updateMock.mock.calls[0]?.[0];
+      if (!callArgs) {
+        throw new Error("test setup failed: update was not called");
+      }
+      expect(callArgs.data).toEqual({ status: "Archived" });
+    });
+
+    it("includes all members ordered by createdAt ascending", async () => {
+      const { repository, updateMock } = buildUpdateStatusHarness();
+      updateMock.mockResolvedValue(buildPrismaTrip({ status: "Archived" }));
+
+      await repository.updateStatus("trip-1", "Archived");
+
+      const callArgs = updateMock.mock.calls[0]?.[0];
+      expect(callArgs?.include).toEqual({
+        members: { orderBy: { createdAt: "asc" } },
+      });
+    });
+
+    it("maps the Prisma result into a Domain Trip", async () => {
+      const { repository, updateMock } = buildUpdateStatusHarness();
+      updateMock.mockResolvedValue(buildPrismaTrip({ status: "Archived" }));
+
+      const result = await repository.updateStatus("trip-1", "Archived");
+
+      expect(result.status).toBe("Archived");
+      expect(result.members).toHaveLength(1);
+    });
+
+    it("translates a simulated P2025 into TripNotFoundError with the given tripId", async () => {
+      const { repository, updateMock } = buildUpdateStatusHarness();
+      const notFoundError = new Prisma.PrismaClientKnownRequestError(
+        "An operation failed because it depends on one or more records that were required but not found.",
+        { code: "P2025", clientVersion: "6.19.3" },
+      );
+      updateMock.mockRejectedValue(notFoundError);
+
+      await expect(
+        repository.updateStatus("unknown-trip", "Archived"),
+      ).rejects.toThrow(new TripNotFoundError("unknown-trip"));
+    });
+
+    it("propagates a non-P2025 error unchanged", async () => {
+      const { repository, updateMock } = buildUpdateStatusHarness();
+      const otherError = new Error("connection lost");
+      updateMock.mockRejectedValue(otherError);
+
+      await expect(repository.updateStatus("trip-1", "Archived")).rejects.toBe(
+        otherError,
+      );
     });
   });
 });

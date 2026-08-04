@@ -1,5 +1,5 @@
 import { Injectable } from "@nestjs/common";
-import type { Prisma } from "@prisma/client";
+import { Prisma } from "@prisma/client";
 import type {
   TripMemberRole,
   TripMemberStatus,
@@ -22,6 +22,7 @@ import type {
   TripRepositoryPort,
   UpsertTripMemberData,
 } from "../../domain/ports/trip.repository.port";
+import { TripNotFoundError } from "../../domain/trip-not-found.error";
 import { TripDateRange } from "../../domain/value-objects/trip-date-range.value-object";
 
 type PrismaTripWithMembers = Prisma.TripGetPayload<{
@@ -68,6 +69,13 @@ function toTripProps(trip: PrismaTripWithMembers): TripProps {
 
 function toDomainTrip(trip: PrismaTripWithMembers): Trip {
   return Trip.fromPersistence(toTripProps(trip));
+}
+
+function isPrismaRecordNotFoundError(error: unknown): boolean {
+  return (
+    error instanceof Prisma.PrismaClientKnownRequestError &&
+    error.code === "P2025"
+  );
 }
 
 @Injectable()
@@ -130,21 +138,60 @@ export class PrismaTripRepository implements TripRepositoryPort {
     return toDomainTrip(trip);
   }
 
-  // Not implemented: write-side methods are out of scope for Lot 5B.2a
-  // (createWithOwner only). Scheduled for later 5B.2 sub-steps. Never
-  // exercised by any test.
+  async updateDetails(tripId: string, data: UpdateTripData): Promise<Trip> {
+    try {
+      const trip = await this.prisma.trip.update({
+        where: { id: tripId },
+        data: {
+          ...(data.name !== undefined && { name: data.name }),
+          ...(data.description !== undefined && {
+            description: data.description,
+          }),
+          ...(data.destination !== undefined && {
+            destination: data.destination,
+          }),
+          ...(data.dateRange !== undefined && {
+            startDate: data.dateRange.startDate,
+            endDate: data.dateRange.endDate,
+          }),
+          ...(data.baseCurrency !== undefined && {
+            baseCurrency: data.baseCurrency,
+          }),
+        },
+        include: MEMBERS_INCLUDE_ORDERED_BY_CREATED_AT,
+      });
 
-  updateDetails(_tripId: string, _data: UpdateTripData): Promise<Trip> {
-    return Promise.reject(
-      new Error("PrismaTripRepository.updateDetails is not implemented yet"),
-    );
+      return toDomainTrip(trip);
+    } catch (error: unknown) {
+      if (isPrismaRecordNotFoundError(error)) {
+        throw new TripNotFoundError(tripId);
+      }
+
+      throw error;
+    }
   }
 
-  updateStatus(_tripId: string, _status: TripStatus): Promise<Trip> {
-    return Promise.reject(
-      new Error("PrismaTripRepository.updateStatus is not implemented yet"),
-    );
+  async updateStatus(tripId: string, status: TripStatus): Promise<Trip> {
+    try {
+      const trip = await this.prisma.trip.update({
+        where: { id: tripId },
+        data: { status },
+        include: MEMBERS_INCLUDE_ORDERED_BY_CREATED_AT,
+      });
+
+      return toDomainTrip(trip);
+    } catch (error: unknown) {
+      if (isPrismaRecordNotFoundError(error)) {
+        throw new TripNotFoundError(tripId);
+      }
+
+      throw error;
+    }
   }
+
+  // Not implemented: write-side methods are out of scope for Lot 5B.2b
+  // (createWithOwner, updateDetails, updateStatus only). Scheduled for
+  // later 5B.2 sub-steps. Never exercised by any test.
 
   softDelete(_tripId: string): Promise<void> {
     return Promise.reject(
