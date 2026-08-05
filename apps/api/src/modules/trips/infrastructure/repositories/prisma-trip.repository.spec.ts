@@ -2,7 +2,10 @@ import { Prisma } from "@prisma/client";
 
 import type { PrismaService } from "../../../../common/prisma/prisma.service";
 import type { UpdateTripData } from "../../domain/entities/trip.entity";
-import type { CreateTripData } from "../../domain/ports/trip.repository.port";
+import type {
+  CreateTripData,
+  UpsertTripMemberData,
+} from "../../domain/ports/trip.repository.port";
 import { TripNotFoundError } from "../../domain/trip-not-found.error";
 import { TripDateRange } from "../../domain/value-objects/trip-date-range.value-object";
 
@@ -971,6 +974,409 @@ describe("PrismaTripRepository", () => {
         throw new Error("test setup failed: updateMany was not called");
       }
       expect(callArgs.data).not.toHaveProperty("updatedAt");
+    });
+  });
+
+  describe("upsertMember", () => {
+    type UpdateMock = jest.Mock<
+      Promise<MockPrismaTrip>,
+      [Prisma.TripUpdateArgs]
+    >;
+
+    function buildUpsertMemberHarness(): {
+      repository: PrismaTripRepository;
+      updateMock: UpdateMock;
+      findUniqueMock: jest.Mock;
+      findFirstMock: jest.Mock;
+      findManyMock: jest.Mock;
+      transactionMock: jest.Mock;
+    } {
+      const updateMock = jest.fn<
+        Promise<MockPrismaTrip>,
+        [Prisma.TripUpdateArgs]
+      >();
+      const findUniqueMock = jest.fn();
+      const findFirstMock = jest.fn();
+      const findManyMock = jest.fn();
+      const transactionMock = jest.fn();
+      const prismaStub = {
+        trip: {
+          update: updateMock,
+          findUnique: findUniqueMock,
+          findFirst: findFirstMock,
+          findMany: findManyMock,
+        },
+        $transaction: transactionMock,
+      };
+      const repository = new PrismaTripRepository(
+        prismaStub as unknown as PrismaService,
+      );
+      return {
+        repository,
+        updateMock,
+        findUniqueMock,
+        findFirstMock,
+        findManyMock,
+        transactionMock,
+      };
+    }
+
+    function buildUpsertData(
+      overrides: Partial<UpsertTripMemberData> = {},
+    ): UpsertTripMemberData {
+      return {
+        userId: "user-2",
+        invitedBy: "owner-1",
+        ...overrides,
+      };
+    }
+
+    function getNestedUpsert(
+      callArgs: Prisma.TripUpdateArgs | undefined,
+    ): Prisma.TripMemberUpsertWithWhereUniqueWithoutTripInput {
+      const nestedUpsert = callArgs?.data.members?.upsert;
+      if (!nestedUpsert || Array.isArray(nestedUpsert)) {
+        throw new Error(
+          "test setup failed: expected a single nested member upsert",
+        );
+      }
+      return nestedUpsert;
+    }
+
+    it("calls prisma.trip.update exactly once", async () => {
+      const { repository, updateMock } = buildUpsertMemberHarness();
+      updateMock.mockResolvedValue(buildPrismaTrip());
+
+      await repository.upsertMember("trip-1", buildUpsertData());
+
+      expect(updateMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("calls update with where: { id: tripId } exactly", async () => {
+      const { repository, updateMock } = buildUpsertMemberHarness();
+      updateMock.mockResolvedValue(buildPrismaTrip());
+
+      await repository.upsertMember("trip-1", buildUpsertData());
+
+      const callArgs = updateMock.mock.calls[0]?.[0];
+      if (!callArgs) {
+        throw new Error("test setup failed: update was not called");
+      }
+      expect(callArgs.where).toEqual({ id: "trip-1" });
+    });
+
+    it("uses the exact tripId_userId composite key in the nested upsert where", async () => {
+      const { repository, updateMock } = buildUpsertMemberHarness();
+      updateMock.mockResolvedValue(buildPrismaTrip());
+
+      await repository.upsertMember(
+        "trip-1",
+        buildUpsertData({ userId: "user-2" }),
+      );
+
+      const callArgs = updateMock.mock.calls[0]?.[0];
+      const nestedUpsert = getNestedUpsert(callArgs);
+      expect(nestedUpsert.where).toEqual({
+        tripId_userId: { tripId: "trip-1", userId: "user-2" },
+      });
+    });
+
+    it("sends the exact create block, with the provided role", async () => {
+      const { repository, updateMock } = buildUpsertMemberHarness();
+      updateMock.mockResolvedValue(buildPrismaTrip());
+
+      await repository.upsertMember(
+        "trip-1",
+        buildUpsertData({
+          userId: "user-2",
+          invitedBy: "owner-1",
+          role: "Editor",
+        }),
+      );
+
+      const callArgs = updateMock.mock.calls[0]?.[0];
+      const nestedUpsert = getNestedUpsert(callArgs);
+      expect(nestedUpsert.create).toEqual({
+        userId: "user-2",
+        role: "Editor",
+        status: "Invited",
+        invitedBy: "owner-1",
+        joinedAt: null,
+      });
+    });
+
+    it("defaults the role to 'Member' on creation when role is not provided", async () => {
+      const { repository, updateMock } = buildUpsertMemberHarness();
+      updateMock.mockResolvedValue(buildPrismaTrip());
+
+      await repository.upsertMember(
+        "trip-1",
+        buildUpsertData({ userId: "user-2", invitedBy: "owner-1" }),
+      );
+
+      const callArgs = updateMock.mock.calls[0]?.[0];
+      const nestedUpsert = getNestedUpsert(callArgs);
+      expect(nestedUpsert.create).toMatchObject({ role: "Member" });
+    });
+
+    it("sends the exact update block, with the provided role", async () => {
+      const { repository, updateMock } = buildUpsertMemberHarness();
+      updateMock.mockResolvedValue(buildPrismaTrip());
+
+      await repository.upsertMember(
+        "trip-1",
+        buildUpsertData({
+          userId: "user-2",
+          invitedBy: "owner-1",
+          role: "Editor",
+        }),
+      );
+
+      const callArgs = updateMock.mock.calls[0]?.[0];
+      const nestedUpsert = getNestedUpsert(callArgs);
+      expect(nestedUpsert.update).toEqual({
+        status: "Invited",
+        joinedAt: null,
+        invitedBy: "owner-1",
+        role: "Editor",
+      });
+    });
+
+    it("omits the 'role' key entirely from update when data.role is undefined", async () => {
+      const { repository, updateMock } = buildUpsertMemberHarness();
+      updateMock.mockResolvedValue(buildPrismaTrip());
+
+      await repository.upsertMember(
+        "trip-1",
+        buildUpsertData({ userId: "user-2", invitedBy: "owner-1" }),
+      );
+
+      const callArgs = updateMock.mock.calls[0]?.[0];
+      const nestedUpsert = getNestedUpsert(callArgs);
+      expect(nestedUpsert.update).not.toHaveProperty("role");
+      expect(nestedUpsert.update).toEqual({
+        status: "Invited",
+        joinedAt: null,
+        invitedBy: "owner-1",
+      });
+    });
+
+    it("sets status: 'Invited' in both the create and update branches", async () => {
+      const { repository, updateMock } = buildUpsertMemberHarness();
+      updateMock.mockResolvedValue(buildPrismaTrip());
+
+      await repository.upsertMember("trip-1", buildUpsertData());
+
+      const callArgs = updateMock.mock.calls[0]?.[0];
+      const nestedUpsert = getNestedUpsert(callArgs);
+      expect(nestedUpsert.create.status).toBe("Invited");
+      expect(nestedUpsert.update.status).toBe("Invited");
+    });
+
+    it("sets joinedAt: null in both the create and update branches", async () => {
+      const { repository, updateMock } = buildUpsertMemberHarness();
+      updateMock.mockResolvedValue(buildPrismaTrip());
+
+      await repository.upsertMember("trip-1", buildUpsertData());
+
+      const callArgs = updateMock.mock.calls[0]?.[0];
+      const nestedUpsert = getNestedUpsert(callArgs);
+      expect(nestedUpsert.create.joinedAt).toBeNull();
+      expect(nestedUpsert.update.joinedAt).toBeNull();
+    });
+
+    it("propagates invitedBy in both the create and update branches", async () => {
+      const { repository, updateMock } = buildUpsertMemberHarness();
+      updateMock.mockResolvedValue(buildPrismaTrip());
+
+      await repository.upsertMember(
+        "trip-1",
+        buildUpsertData({ invitedBy: "owner-42" }),
+      );
+
+      const callArgs = updateMock.mock.calls[0]?.[0];
+      const nestedUpsert = getNestedUpsert(callArgs);
+      expect(nestedUpsert.create.invitedBy).toBe("owner-42");
+      expect(nestedUpsert.update.invitedBy).toBe("owner-42");
+    });
+
+    it("behaves identically for a conceptual re-invitation of a Declined member", async () => {
+      const { repository, updateMock } = buildUpsertMemberHarness();
+      updateMock.mockResolvedValue(
+        buildPrismaTrip({
+          members: [
+            {
+              ...OWNER_MEMBER,
+              id: "member-2",
+              userId: "user-2",
+              status: "Invited",
+            },
+          ],
+        }),
+      );
+
+      await repository.upsertMember(
+        "trip-1",
+        buildUpsertData({ userId: "user-2", invitedBy: "owner-1" }),
+      );
+
+      const callArgs = updateMock.mock.calls[0]?.[0];
+      const nestedUpsert = getNestedUpsert(callArgs);
+      expect(nestedUpsert.update).toEqual({
+        status: "Invited",
+        joinedAt: null,
+        invitedBy: "owner-1",
+      });
+    });
+
+    it("behaves identically for a Removed member", async () => {
+      const { repository, updateMock } = buildUpsertMemberHarness();
+      updateMock.mockResolvedValue(
+        buildPrismaTrip({
+          members: [
+            {
+              ...OWNER_MEMBER,
+              id: "member-2",
+              userId: "user-2",
+              status: "Invited",
+            },
+          ],
+        }),
+      );
+
+      await repository.upsertMember(
+        "trip-1",
+        buildUpsertData({ userId: "user-2", invitedBy: "owner-1" }),
+      );
+
+      const callArgs = updateMock.mock.calls[0]?.[0];
+      const nestedUpsert = getNestedUpsert(callArgs);
+      expect(nestedUpsert.update).toEqual({
+        status: "Invited",
+        joinedAt: null,
+        invitedBy: "owner-1",
+      });
+    });
+
+    it("includes members ordered by createdAt ascending", async () => {
+      const { repository, updateMock } = buildUpsertMemberHarness();
+      updateMock.mockResolvedValue(buildPrismaTrip());
+
+      await repository.upsertMember("trip-1", buildUpsertData());
+
+      const callArgs = updateMock.mock.calls[0]?.[0];
+      expect(callArgs?.include).toEqual({
+        members: { orderBy: { createdAt: "asc" } },
+      });
+    });
+
+    it("maps the Prisma result into a full Domain Trip", async () => {
+      const { repository, updateMock } = buildUpsertMemberHarness();
+      const secondMember = {
+        ...OWNER_MEMBER,
+        id: "member-2",
+        userId: "user-2",
+        role: "Member" as const,
+        status: "Invited" as const,
+        joinedAt: null,
+      };
+      updateMock.mockResolvedValue(
+        buildPrismaTrip({ members: [OWNER_MEMBER, secondMember] }),
+      );
+
+      const result = await repository.upsertMember("trip-1", buildUpsertData());
+
+      expect(result.id).toBe("trip-1");
+      expect(result.members).toHaveLength(2);
+      expect(result.members[1]?.userId).toBe("user-2");
+      expect(result.members[1]?.status).toBe("Invited");
+    });
+
+    it("translates a simulated P2025 into TripNotFoundError with the given tripId", async () => {
+      const { repository, updateMock } = buildUpsertMemberHarness();
+      const notFoundError = new Prisma.PrismaClientKnownRequestError(
+        "An operation failed because it depends on one or more records that were required but not found.",
+        { code: "P2025", clientVersion: "6.19.3" },
+      );
+      updateMock.mockRejectedValue(notFoundError);
+
+      await expect(
+        repository.upsertMember("unknown-trip", buildUpsertData()),
+      ).rejects.toThrow(new TripNotFoundError("unknown-trip"));
+    });
+
+    it("propagates a simulated P2003 unchanged, with the same reference", async () => {
+      const { repository, updateMock } = buildUpsertMemberHarness();
+      const foreignKeyError = new Prisma.PrismaClientKnownRequestError(
+        "Foreign key constraint failed on the field: `trip_members_invited_by_fkey`",
+        {
+          code: "P2003",
+          clientVersion: "6.19.3",
+          meta: { constraint: "trip_members_invited_by_fkey" },
+        },
+      );
+      updateMock.mockRejectedValue(foreignKeyError);
+
+      await expect(
+        repository.upsertMember("trip-1", buildUpsertData()),
+      ).rejects.toBe(foreignKeyError);
+    });
+
+    it("propagates an unexpected error with the same reference", async () => {
+      const { repository, updateMock } = buildUpsertMemberHarness();
+      const otherError = new Error("connection lost");
+      updateMock.mockRejectedValue(otherError);
+
+      await expect(
+        repository.upsertMember("trip-1", buildUpsertData()),
+      ).rejects.toBe(otherError);
+    });
+
+    it("never calls any read method (findUnique, findFirst, findMany) beforehand", async () => {
+      const {
+        repository,
+        updateMock,
+        findUniqueMock,
+        findFirstMock,
+        findManyMock,
+      } = buildUpsertMemberHarness();
+      updateMock.mockResolvedValue(buildPrismaTrip());
+
+      await repository.upsertMember("trip-1", buildUpsertData());
+
+      expect(findUniqueMock).not.toHaveBeenCalled();
+      expect(findFirstMock).not.toHaveBeenCalled();
+      expect(findManyMock).not.toHaveBeenCalled();
+    });
+
+    it("never calls $transaction", async () => {
+      const { repository, updateMock, transactionMock } =
+        buildUpsertMemberHarness();
+      updateMock.mockResolvedValue(buildPrismaTrip());
+
+      await repository.upsertMember("trip-1", buildUpsertData());
+
+      expect(transactionMock).not.toHaveBeenCalled();
+    });
+
+    it("makes no second Prisma call after update", async () => {
+      const {
+        repository,
+        updateMock,
+        findUniqueMock,
+        findFirstMock,
+        findManyMock,
+        transactionMock,
+      } = buildUpsertMemberHarness();
+      updateMock.mockResolvedValue(buildPrismaTrip());
+
+      await repository.upsertMember("trip-1", buildUpsertData());
+
+      expect(updateMock).toHaveBeenCalledTimes(1);
+      expect(findUniqueMock).toHaveBeenCalledTimes(0);
+      expect(findFirstMock).toHaveBeenCalledTimes(0);
+      expect(findManyMock).toHaveBeenCalledTimes(0);
+      expect(transactionMock).toHaveBeenCalledTimes(0);
     });
   });
 });

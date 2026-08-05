@@ -203,14 +203,53 @@ export class PrismaTripRepository implements TripRepositoryPort {
     });
   }
 
+  async upsertMember(
+    tripId: string,
+    data: UpsertTripMemberData,
+  ): Promise<Trip> {
+    try {
+      const trip = await this.prisma.trip.update({
+        where: { id: tripId },
+        data: {
+          members: {
+            upsert: {
+              where: {
+                tripId_userId: {
+                  tripId,
+                  userId: data.userId,
+                },
+              },
+              create: {
+                userId: data.userId,
+                role: data.role ?? "Member",
+                status: "Invited",
+                invitedBy: data.invitedBy,
+                joinedAt: null,
+              },
+              update: {
+                status: "Invited",
+                joinedAt: null,
+                invitedBy: data.invitedBy,
+                ...(data.role !== undefined ? { role: data.role } : {}),
+              },
+            },
+          },
+        },
+        include: MEMBERS_INCLUDE_ORDERED_BY_CREATED_AT,
+      });
+
+      return toDomainTrip(trip);
+    } catch (error: unknown) {
+      if (isPrismaRecordNotFoundError(error)) {
+        throw new TripNotFoundError(tripId);
+      }
+
+      throw error;
+    }
+  }
+
   // Remaining member write-side methods are not implemented yet.
   // Scheduled for later Lot 5B.2 sub-steps. Never exercised by any test.
-
-  upsertMember(_tripId: string, _data: UpsertTripMemberData): Promise<Trip> {
-    return Promise.reject(
-      new Error("PrismaTripRepository.upsertMember is not implemented yet"),
-    );
-  }
 
   updateMemberStatus(
     _tripId: string,
